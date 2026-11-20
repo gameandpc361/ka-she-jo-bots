@@ -5,7 +5,6 @@ import WebKit
 struct MainView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
-    @State private var showLogin = false
     @State private var bodyText = ""
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var imageData: [Data] = []
@@ -15,11 +14,13 @@ struct MainView: View {
     @FocusState private var composeFocused: Bool
 
     var body: some View {
-        TabView {
-            composeView.tabItem { Label("投稿", systemImage: "square.and.pencil") }
-            draftsView.tabItem { Label("下書き", systemImage: "doc.text") }
-            historyView.tabItem { Label("履歴", systemImage: "clock.arrow.circlepath") }
-            settingsView.tabItem { Label("設定", systemImage: "gear") }
+        TabView(selection: $model.activeTab) {
+            composeView.tabItem { Label("投稿", systemImage: "square.and.pencil") }.tag("compose")
+            draftsView.tabItem { Label("下書き", systemImage: "doc.text") }.tag("drafts")
+            historyView.tabItem { Label("履歴", systemImage: "clock.arrow.circlepath") }.tag("history")
+            webViewTab.tabItem { Label("Web", systemImage: "safari") }.tag("web")
+            logsView.tabItem { Label("ログ", systemImage: "list.bullet.rectangle") }.tag("logs")
+            settingsView.tabItem { Label("設定", systemImage: "gear") }.tag("settings")
         }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.checkDuePosts() } }
         .task {
@@ -31,16 +32,50 @@ struct MainView: View {
         .alert("お知らせ", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK") { notice = nil }
         } message: { Text(notice ?? "") }
-        .sheet(isPresented: $showLogin) {
-            NavigationStack {
-                WebLoginView(webView: model.webView)
-                    .navigationTitle("Kashejoログイン")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) { Button("閉じる") { showLogin = false } }
-                        ToolbarItem(placement: .topBarTrailing) { Button("投稿画面") { model.openPostPage() } }
+    }
+
+    private var webViewTab: some View {
+        NavigationStack {
+            WebLoginView(webView: model.webView)
+                .navigationTitle("Kashejo Web")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        Button { model.openHomePage() } label: { Image(systemName: "house") }
+                        Button { Task { await model.checkSession() } } label: { Image(systemName: "person.crop.circle.badge.checkmark") }
+                        Button { model.webView.reload() } label: { Image(systemName: "arrow.clockwise") }
                     }
+                }
+                .safeAreaInset(edge: .bottom) {
+                    HStack {
+                        Text(model.status).font(.caption).lineLimit(1)
+                        Spacer()
+                        Button("ログイン確認") { Task { await model.checkSession() } }
+                    }.padding(.horizontal).padding(.vertical, 8).background(.bar)
+                }
+        }
+        .onAppear { if model.webView.url == nil { model.openHomePage() } }
+    }
+
+    private var logsView: some View {
+        NavigationStack {
+            List {
+                Section {
+                    LabeledContent("ログイン状態", value: model.status)
+                    LabeledContent("WebView URL", value: model.webView.url?.absoluteString ?? "未読み込み")
+                    LabeledContent("ログ件数", value: "\(model.logs.count)")
+                    Button("ログイン状態を再確認") { Task { await model.checkSession() } }
+                    Button("ログをコピー") { UIPasteboard.general.string = model.logs.reversed().joined(separator: "\n") }
+                    Button("ログを消去", role: .destructive) { model.clearLogs() }
+                }
+                Section("診断ログ（新しい順）") {
+                    if model.logs.isEmpty { Text("ログはまだありません").foregroundStyle(.secondary) }
+                    ForEach(Array(model.logs.enumerated()), id: \.offset) { _, line in
+                        Text(line).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    }
+                }
             }
+            .navigationTitle("診断ログ")
         }
     }
 
@@ -100,7 +135,7 @@ struct MainView: View {
             .navigationTitle("Kashejo Assistant")
             .scrollDismissesKeyboard(.interactively)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) { Button { showLogin = true } label: { Image(systemName: "person.crop.circle") } }
+                ToolbarItem(placement: .topBarTrailing) { Button { model.openHomePage() } label: { Image(systemName: "person.crop.circle") } }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("キーボードを閉じる") { composeFocused = false }
@@ -171,7 +206,7 @@ struct MainView: View {
     }
 
     private var settingsView: some View {
-        SettingsView(showLogin: $showLogin)
+        SettingsView()
             .environmentObject(model)
     }
 
@@ -180,7 +215,6 @@ struct MainView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
-    @Binding var showLogin: Bool
     @FocusState private var settingsFocused: Bool
     @State private var accountIDText = ""
     @State private var siteURLText = ""
@@ -204,9 +238,9 @@ struct SettingsView: View {
                     Text("投稿ページ: \(siteURLText.trimmingCharacters(in: .whitespacesAndNewlines))/a/\(accountIDText)/posts")
                         .font(.footnote).foregroundStyle(.secondary)
                     Button("接続設定を保存") { saveSettings() }
-                    Button("投稿画面を開く") {
+                    Button("Kashejoを開く") {
                         saveSettings()
-                        model.openPostPage()
+                        model.openHomePage()
                     }
                     Button("トップページを開く") {
                         saveSettings()
@@ -238,7 +272,6 @@ struct SettingsView: View {
                 Section("ログイン") {
                     Button("Kashejoにログイン / セッション確認") {
                         model.openHomePage()
-                        showLogin = true
                     }
                     Text("ログイン情報はアプリ内WebViewに保存されます。SafariのCookieとは共有されません。")
                         .font(.footnote).foregroundStyle(.secondary)
