@@ -8,6 +8,5 @@ struct KashejoQueueAttributes: ActivityAttributes {
         var status: String
         var nextAt: Date?
     }
-
     var title: String
 }

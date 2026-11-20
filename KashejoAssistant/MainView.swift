@@ -1,6 +1,9 @@
 import SwiftUI
 import PhotosUI
 import WebKit
+import UniformTypeIdentifiers
+import UIKit
+import ImageIO
 
 struct MainView: View {
     @EnvironmentObject private var model: AppModel
@@ -8,9 +11,15 @@ struct MainView: View {
     @State private var bodyText = ""
     @State private var photos: [PhotosPickerItem] = []
     @State private var imageData: [Data] = []
+    @State private var showFilePicker = false
     @State private var scheduleEnabled = false
     @State private var scheduleDate = Calendar.current.date(byAdding: .hour, value: 1, to: Date()) ?? Date()
     @State private var notice: String?
+    @State private var duplicateCount = 1
+    @State private var selectedDraftIDs = Set<UUID>()
+    @State private var newFolderName = ""
+    @State private var showNewFolder = false
+    @State private var logExportURL: URL?
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -24,20 +33,69 @@ struct MainView: View {
         }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.checkDuePosts(); Task { await model.checkSession() } } }
         .alert("お知らせ", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) { Button("OK") { notice = nil } } message: { Text(notice ?? "") }
+        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                for url in urls.prefix(max(0, model.maxImageCount - imageData.count)) {
+                    let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
+                    do { imageData.append(try Data(contentsOf: url)); model.log("Filesから画像読込: \(url.lastPathComponent)") }
+                    catch { notice = "ファイルを読み込めませんでした: \(error.localizedDescription)" }
+                }
+                showImageWarnings()
+            case .failure(let error): notice = "ファイル選択エラー: \(error.localizedDescription)"
+            }
+        }
+        .sheet(isPresented: $showNewFolder) {
+            NavigationStack { Form { TextField("フォルダ名", text: $newFolderName) }
+                .navigationTitle("キューフォルダ作成")
+                .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("閉じる") { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) } } }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("キャンセル") { showNewFolder = false } }; ToolbarItem(placement: .confirmationAction) { Button("作成") { model.createFolder(name: newFolderName); newFolderName = ""; showNewFolder = false } } }
+            }.presentationDetents([.medium])
+        }
+        .sheet(isPresented: Binding(get: { logExportURL != nil }, set: { if !$0 { logExportURL = nil } })) { if let url = logExportURL { ShareSheetView(activityItems: [url]) } }
     }
+
     private var compose: some View {
         NavigationStack {
             Form {
-                Section("投稿本文") { TextEditor(text: $bodyText).focused($focused).frame(minHeight: 120) }
+                Section("投稿本文") {
+                    TextEditor(text: $bodyText).focused($focused).frame(minHeight: 120)
+                    HStack { Text("{random} は下書き作成時に8文字の英数字へ置換").font(.caption).foregroundStyle(.secondary); Spacer(); Button("キーボードを閉じる") { focused = false; UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }.font(.caption) }
+                }
                 Section("画像") {
-                    PhotosPicker(selection: $photos, maxSelectionCount: model.maxImageCount, matching: .images) { Label("写真を最大\(model.maxImageCount)枚選択", systemImage: "photo") }
-                    Text("\(imageData.count)枚選択済み").foregroundStyle(.secondary)
-                    if !imageData.isEmpty { Button("画像をクリア", role: .destructive) { photos = []; imageData = [] } }
+                    HStack {
+                        PhotosPicker(selection: $photos, maxSelectionCount: model.maxImageCount, matching: .images) { Label("写真", systemImage: "photo") }
+                        Spacer()
+                        Button { showFilePicker = true } label: { Label("ファイル", systemImage: "folder") }
+                    }
+                    Text("\(imageData.count)枚選択済み ・ 最大\(model.maxImageCount)枚").foregroundStyle(.secondary)
+                    if !imageData.isEmpty {
+                        ScrollView(.horizontal) {
+                            HStack(spacing: 10) {
+                                ForEach(Array(imageData.enumerated()), id: \.offset) { index, data in
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        AnimatedImagePreview(data: data).frame(width: 112, height: 100).clipShape(RoundedRectangle(cornerRadius: 8))
+                                        Text(imageDescription(data)).font(.caption2).lineLimit(1)
+                                        Button("削除") { imageData.remove(at: index) }.font(.caption).tint(.red)
+                                    }
+                                }
+                            }
+                        }
+                        Button("画像をすべてクリア", role: .destructive) { photos = []; imageData = [] }
+                    }
+                    Text("GIFは元データを保持して送信します。10MiB超過などは警告のみで、アプリ側では除外しません。サーバー側の制限により拒否される場合があります。").font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("下書きの一括作成") {
+                    Stepper("作成数: \(duplicateCount)件（最大10件）", value: $duplicateCount, in: 1...10)
+                    Button("同じ画像・本文で下書きを\(duplicateCount)件作成") {
+                        model.duplicateDrafts(bodyTemplate: bodyText, images: imageData, count: duplicateCount)
+                        notice = "\(duplicateCount)件の下書きを作成しました。{random} は各下書きごとに異なる文字列になります。"
+                    }
                 }
                 Section("予約") {
-                    Toggle("予約する", isOn: $scheduleEnabled)
-                    if scheduleEnabled { DatePicker("投稿予定", selection: $scheduleDate, in: Date()..., displayedComponents: [.date,.hourAndMinute]) }
-                    Text("予約時刻にアプリが実行可能な状態であれば処理を試みます。バックグラウンド実行は保証されません。").font(.footnote).foregroundStyle(.secondary)
+                    Toggle("予約通知を設定", isOn: $scheduleEnabled)
+                    if scheduleEnabled { DatePicker("予定時刻", selection: $scheduleDate, in: Date()..., displayedComponents: [.date,.hourAndMinute]) }
+                    Text("iOSの制約により、アプリが停止中のWebフォーム投稿は保証されません。").font(.footnote).foregroundStyle(.secondary)
                 }
                 Section {
                     Button("下書き保存") { model.saveDraft(body: bodyText, images: imageData, scheduledAt: scheduleEnabled ? scheduleDate : nil); clearComposer(); notice = "下書きを保存しました" }
@@ -46,11 +104,31 @@ struct MainView: View {
             }
             .navigationTitle("Kashejo Assistant")
             .scrollDismissesKeyboard(.interactively)
-            .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("キーボードを閉じる") { focused = false } } }
-            .task(id: photos) { var loaded: [Data] = []; for photo in photos { if let d = try? await photo.loadTransferable(type: Data.self), let image = UIImage(data: d), let jpeg = image.jpegData(compressionQuality: 0.8) { loaded.append(jpeg) } }; imageData = loaded }
+            .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("閉じる") { focused = false; UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) } } }
+            .task(id: photos) {
+                guard !photos.isEmpty else { return }
+                var loaded: [Data] = []
+                for photo in photos.prefix(model.maxImageCount) { if let d = try? await photo.loadTransferable(type: Data.self) { loaded.append(d) } }
+                imageData.append(contentsOf: loaded); showImageWarnings()
+            }
         }
     }
     private func clearComposer() { bodyText = ""; imageData = []; photos = []; scheduleEnabled = false; focused = false }
+    private func imageDescription(_ data: Data) -> String {
+        let size = ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
+        let type: String
+        if data.starts(with: Array("GIF8".utf8)) { type = "GIF" }
+        else if data.starts(with: [0x89,0x50,0x4E,0x47]) { type = "PNG" }
+        else if data.starts(with: [0xFF,0xD8,0xFF]) { type = "JPEG" }
+        else { type = "画像" }
+        return "\(type)・\(size)"
+    }
+    private func showImageWarnings() {
+        let large = imageData.filter { $0.count > 10 * 1024 * 1024 }.count
+        if large > 0 { notice = "10MiBを超える画像が\(large)枚あります。警告のみで選択は維持しますが、Kashejo側で拒否される可能性があります。" }
+        if imageData.count > model.maxImageCount { imageData = Array(imageData.prefix(model.maxImageCount)); notice = "最大枚数を超えたため、先頭\(model.maxImageCount)枚を保持しました。" }
+    }
+
     private var webTab: some View {
         NavigationStack {
             WebLoginView(webView: model.webView).navigationTitle("Kashejo Web").navigationBarTitleDisplayMode(.inline)
@@ -58,43 +136,166 @@ struct MainView: View {
                 .safeAreaInset(edge: .bottom) { HStack { Text(model.status).font(.caption).lineLimit(1); Spacer(); Button("確認") { Task { await model.checkSession() } } }.padding().background(.bar) }
         }.onAppear { if model.webView.url == nil { model.openHomePage() } }
     }
+
     private var draftsTab: some View {
         NavigationStack {
             List {
-                if model.drafts.isEmpty { ContentUnavailableView("下書きはありません", systemImage: "doc.text") }
-                ForEach(model.drafts) { item in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(item.body).lineLimit(3)
-                        Text("画像 \(item.images.count)枚 ・ \(item.scheduledAt?.formatted(date: .numeric, time: .shortened) ?? "未予約")").font(.caption).foregroundStyle(.secondary)
-                        HStack { Button("投稿") { Task { let ok = await model.post(item); notice = ok ? "投稿しました" : (model.lastError ?? "失敗") } }; Button("削除", role: .destructive) { model.deleteDraft(item) } }.buttonStyle(.bordered)
+                Section("キューフォルダ") {
+                    Picker("対象フォルダ", selection: Binding(get: { model.selectedFolderID ?? UUID.zero }, set: { model.selectedFolderID = $0 == UUID.zero ? nil : $0 })) {
+                        Text("未分類").tag(UUID.zero)
+                        ForEach(model.folders) { folder in Text(folder.name).tag(folder.id) }
+                    }
+                    Button { showNewFolder = true } label: { Label("フォルダを作成", systemImage: "folder.badge.plus") }
+                    Text("このフォルダに新しく保存した下書きがキュー対象になります。別フォルダの下書きは投稿しません。").font(.caption).foregroundStyle(.secondary)
+                }
+                Section("下書き（\(model.drafts.count)件）") {
+                    if !selectedDraftIDs.isEmpty {
+                        Button("選択した\(selectedDraftIDs.count)件をこのフォルダへ移動") {
+                            model.moveDrafts(selectedDraftIDs, to: model.selectedFolderID); selectedDraftIDs.removeAll()
+                        }
+                    }
+                    let items = model.drafts
+                    if items.isEmpty { ContentUnavailableView("下書きはありません", systemImage: "doc.text") }
+                    ForEach(items) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Button(selectedDraftIDs.contains(item.id) ? "選択解除" : "選択") {
+                                    if selectedDraftIDs.contains(item.id) { selectedDraftIDs.remove(item.id) } else { selectedDraftIDs.insert(item.id) }
+                                }.buttonStyle(.bordered)
+                                Text(model.folders.first(where: { $0.id == item.folderID })?.name ?? "未分類").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Text(item.body.isEmpty ? "（本文なし）" : item.body).lineLimit(3)
+                            Text("画像 \(item.images.count)枚 ・ \(item.scheduledAt?.formatted(date: .numeric, time: .shortened) ?? "未予約")").font(.caption).foregroundStyle(.secondary)
+                            if !item.images.isEmpty { ScrollView(.horizontal) { HStack { ForEach(Array(item.images.prefix(5).enumerated()), id: \.offset) { _, d in AnimatedImagePreview(data: d).frame(width: 68, height: 58).clipShape(RoundedRectangle(cornerRadius: 6)) } } } }
+                            HStack { Button("投稿") { Task { let ok = await model.post(item); notice = ok ? "投稿しました" : (model.lastError ?? "失敗") } }; Button("削除", role: .destructive) { model.deleteDraft(item) } }.buttonStyle(.bordered)
+                        }
                     }
                 }
-                Section("連続投稿") {
+                Section("連続投稿キュー") {
+                    Text("現在のフォルダ: \(model.folders.first(where: { $0.id == model.selectedFolderID })?.name ?? "未分類")").font(.caption).foregroundStyle(.secondary)
                     Text(model.queueProgress).font(.caption)
-                    Button("下書きを順番に投稿") { model.startQueue() }
+                    Button("このフォルダを順番に投稿") { model.startQueue() }
                     Button("キュー停止", role: .destructive) { model.stopQueue() }
+                    Text("投稿間隔は60〜3600秒、1回のキューは最大10件です。アプリを前面に置いて使用してください。").font(.footnote).foregroundStyle(.secondary)
                 }
             }.navigationTitle("下書き・キュー")
         }
     }
+
     private var historyTab: some View {
-        NavigationStack { List { if model.history.isEmpty { ContentUnavailableView("履歴はありません", systemImage: "clock") }; ForEach(model.history) { h in VStack(alignment: .leading, spacing: 5) { Text(h.body).lineLimit(3); Text("\(h.date.formatted(date: .numeric, time: .shortened)) ・画像 \(h.imageCount)枚").font(.caption).foregroundStyle(.secondary); if let url = URL(string: h.resultURL) { Link("投稿を開く", destination: url) } } } }.navigationTitle("投稿履歴") }
+        NavigationStack {
+            List {
+                if model.history.isEmpty { ContentUnavailableView("履歴はありません", systemImage: "clock") }
+                ForEach(model.history) { h in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(h.body).lineLimit(3)
+                        Text("\(h.date.formatted(date: .numeric, time: .shortened)) ・画像 \(h.imageCount)枚").font(.caption).foregroundStyle(.secondary)
+                        if let url = URL(string: h.resultURL) {
+                            Button("投稿を開く") {
+                                if model.openHistoryInApp { model.webView.load(URLRequest(url: url)); model.activeTab = "web" }
+                                else { UIApplication.shared.open(url) }
+                            }
+                        }
+                    }
+                }
+            }.navigationTitle("投稿履歴")
+        }
     }
+
     private var logsTab: some View {
-        NavigationStack { List { Section { LabeledContent("状態", value: model.status); LabeledContent("WebView", value: model.webView.url?.path ?? "未読込"); Button("ログイン確認") { Task { await model.checkSession() } }; Button("ログをコピー") { UIPasteboard.general.string = model.logs.reversed().joined(separator: "\n") }; Button("ログ消去", role: .destructive) { model.clearLogs() } }; Section("診断ログ") { ForEach(Array(model.logs.enumerated()), id: \.offset) { _, line in Text(line).font(.system(.caption, design: .monospaced)).textSelection(.enabled) } } }.navigationTitle("診断ログ") }
+        NavigationStack {
+            List {
+                Section {
+                    LabeledContent("状態", value: model.status)
+                    LabeledContent("WebView", value: model.webView.url?.path ?? "未読込")
+                    Button("ログイン確認") { Task { await model.checkSession() } }
+                    Button("ログをコピー") { UIPasteboard.general.string = model.logs.reversed().joined(separator: "\n") }
+                    Button("ログをエクスポート") { logExportURL = model.makeLogExport() }
+                    Button("ログ消去", role: .destructive) { model.clearLogs() }
+                }
+                Section("診断ログ（最大1000行）") { ForEach(Array(model.logs.enumerated()), id: \.offset) { _, line in Text(line).font(.system(.caption, design: .monospaced)).textSelection(.enabled) } }
+            }.navigationTitle("診断ログ")
+        }
     }
+
     private var settingsTab: some View {
-        NavigationStack { Form {
-            Section("接続") { TextField("サイトURL", text: $model.siteBaseURL).textInputAutocapitalization(.never).keyboardType(.URL).autocorrectionDisabled(); TextField("アカウントID（表示/確認用）", text: $model.accountID).keyboardType(.numberPad); Button("トップページを開く") { model.openHomePage() }; Text("投稿先はページ内の実際のフォームactionを使用します。アカウントIDから投稿URLを組み立てません。").font(.footnote).foregroundStyle(.secondary) }
-            Section("キュー") { LabeledContent("間隔", value: "\(Int(model.queueIntervalSeconds))秒"); Slider(value: $model.queueIntervalSeconds, in: 5...300, step: 5); LabeledContent("最大件数", value: "\(model.queueMaxCount)件"); Slider(value: Binding(get: { Double(model.queueMaxCount) }, set: { model.queueMaxCount = Int($0) }), in: 1...50, step: 1) }
-            Section("画像") { LabeledContent("最大枚数", value: "\(model.maxImageCount)枚"); Slider(value: Binding(get: { Double(model.maxImageCount) }, set: { model.maxImageCount = Int($0) }), in: 1...20, step: 1) }
-            Section("バックグラウンドとLive Activity") { Text("Live Activityはキュー進捗を表示します。表示自体が投稿処理を継続させるわけではありません。iOSのBGTaskSchedulerは実行時刻を保証せず、WebKitフォーム送信はアプリが前面にあるときに行います。").font(.footnote) }
-            Section("状態") { Text(model.status); if let e = model.lastError { Text(e).foregroundStyle(.red) } }
-        }.navigationTitle("設定") }
+        NavigationStack {
+            Form {
+                Section("接続") {
+                    TextField("サイトURL", text: $model.siteBaseURL).textInputAutocapitalization(.never).keyboardType(.URL).autocorrectionDisabled()
+                    TextField("アカウントID（表示/確認用）", text: $model.accountID).keyboardType(.numberPad)
+                    Button("トップページを開く") { model.openHomePage() }
+                    Text("投稿はWebView内の実際のフォームを使用し、APIエンドポイントには送信しません。").font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("キュー") {
+                    LabeledContent("投稿間隔", value: "\(Int(model.queueIntervalSeconds))秒")
+                    Slider(value: $model.queueIntervalSeconds, in: 60...3600, step: 30)
+                    LabeledContent("1回の最大件数", value: "\(model.queueMaxCount)件")
+                    Slider(value: Binding(get: { Double(model.queueMaxCount) }, set: { model.queueMaxCount = Int($0) }), in: 1...10, step: 1)
+                }
+                Section("画像") {
+                    LabeledContent("最大枚数", value: "\(model.maxImageCount)枚")
+                    Slider(value: Binding(get: { Double(model.maxImageCount) }, set: { model.maxImageCount = Int($0) }), in: 1...20, step: 1)
+                    Text("10MiB超過は警告のみ。GIF/PNG/JPEG等の元データをできるだけ保持します。").font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("履歴の開き方") {
+                    Picker("投稿を開く", selection: $model.openHistoryInApp) { Text("アプリ内WebView").tag(true); Text("外部ブラウザ（iOSの既定）").tag(false) }
+                    Text("外部ブラウザはiOSで設定されている既定のブラウザが開きます。ブラウザの選択変更はiOSの設定で行ってください。").font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("ログの範囲とプライバシー") {
+                    Text("画面遷移、HTTPナビゲーション応答、フォーム送信のURL/メソッド/ステータス/所要時間/応答プレビューを記録します。Cookie・CSRF・パスワード等は記録対象から除外またはマスクします。").font(.footnote)
+                    Text("WKWebViewの全サブリソース通信を完全に傍受・保存する機能ではありません。秘密情報を含む完全な通信ダンプは安全上提供しません。").font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("バックグラウンドとLive Activity") {
+                    Text("Live Activityはキュー進捗表示です。表示自体が投稿処理を継続させるわけではありません。BGTaskSchedulerは実行時刻を保証せず、WebKitフォーム送信はアプリが前面にあるときに行います。").font(.footnote)
+                }
+                Section("状態") { Text(model.status); if let e = model.lastError { Text(e).foregroundStyle(.red) } }
+            }.navigationTitle("設定")
+            .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("閉じる") { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) } } }
+        }
     }
 }
+
 struct WebLoginView: UIViewRepresentable {
     let webView: WKWebView
     func makeUIView(context: Context) -> WKWebView { webView }
     func updateUIView(_ uiView: WKWebView, context: Context) { }
+}
+
+struct AnimatedImagePreview: UIViewRepresentable {
+    let data: Data
+    func makeUIView(context: Context) -> UIImageView {
+        let view = UIImageView(); view.contentMode = .scaleAspectFit; view.clipsToBounds = true; view.backgroundColor = UIColor.secondarySystemBackground; return view
+    }
+    func updateUIView(_ uiView: UIImageView, context: Context) {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { uiView.image = UIImage(data: data); return }
+        let count = min(CGImageSourceGetCount(source), 40)
+        guard count > 1 else { uiView.image = UIImage(data: data); return }
+        var frames: [UIImage] = []
+        var duration: Double = 0
+        for index in 0..<count {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 512,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ]
+            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary) else { continue }
+            frames.append(UIImage(cgImage: cgImage))
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+            let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+            let delay = (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double) ?? (gif?[kCGImagePropertyGIFDelayTime] as? Double) ?? 0.1
+            duration += max(0.02, delay)
+        }
+        uiView.image = frames.count > 1 ? UIImage.animatedImage(with: frames, duration: max(duration, 0.1)) : UIImage(data: data)
+    }
+}
+
+struct ShareSheetView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: activityItems, applicationActivities: nil) }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) { }
+}
+
+private extension UUID {
+    static var zero: UUID { UUID(uuidString: "00000000-0000-0000-0000-000000000000")! }
 }
