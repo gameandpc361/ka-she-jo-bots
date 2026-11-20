@@ -1,3 +1,4 @@
+import Foundation
 import ActivityKit
 
 struct KashejoQueueAttributes: ActivityAttributes {
@@ -7,5 +8,6 @@ struct KashejoQueueAttributes: ActivityAttributes {
         var status: String
         var nextAt: Date?
     }
+
     var title: String
 }
