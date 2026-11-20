@@ -101,6 +101,10 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var maxImageCount: Int { didSet { UserDefaults.standard.set(maxImageCount, forKey: "maxImageCount"); syncActiveProfile() } }
     @Published var openHistoryInApp: Bool { didSet { UserDefaults.standard.set(openHistoryInApp, forKey: "openHistoryInApp"); syncActiveProfile() } }
     @Published var queueProgress = "待機中"
+    @Published var queueNextPostAt: Date?
+    @Published var queueRemainingSeconds: Int = 0
+    @Published var queueLogs: [String] = []
+    @Published var customUserAgent: String = UserDefaults.standard.string(forKey: "customUserAgent") ?? "" { didSet { UserDefaults.standard.set(customUserAgent, forKey: "customUserAgent"); applyUserAgent() } }
     private var queueTask: Task<Void, Never>?
     private var liveActivity: Activity<KashejoQueueAttributes>?
     private var suppressProfileSync = false
@@ -135,9 +139,11 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
         super.init()
         webView.navigationDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+        applyUserAgent()
         persistProfiles()
         loadStore()
         logs = d.stringArray(forKey: "diagnosticLogs") ?? []
+        queueLogs = d.stringArray(forKey: "queueLogs") ?? []
         webView.load(URLRequest(url: normalizedBaseURL ?? URL(string: "https://kashejo.f5.si")!))
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
         log("起動。WKWebView標準セッションを使用")
@@ -192,7 +198,7 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
         maxImageCount = settings.maxImageCount; openHistoryInApp = settings.openHistoryInApp
         let nextWebView = Self.makeWebView(for: profile)
         nextWebView.navigationDelegate = self; nextWebView.allowsBackForwardNavigationGestures = true
-        webView = nextWebView
+        webView = nextWebView; applyUserAgent()
         suppressProfileSync = false
         persistProfiles(); loadStore()
         if let url = normalizedBaseURL { webView.load(URLRequest(url: url)) }
@@ -214,6 +220,12 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
         var names = [folder.name]; var parent = folder.parentID; var visited = Set<UUID>()
         while let id = parent, !visited.contains(id), let item = folders.first(where: { $0.id == id }) { visited.insert(id); names.insert(item.name, at: 0); parent = item.parentID }
         return names.joined(separator: " / ")
+    }
+
+    func applyUserAgent() {
+        let value = customUserAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        webView.customUserAgent = value.isEmpty ? nil : value
+        log(value.isEmpty ? "User-Agent: iOS標準" : "User-Agent: カスタム設定を適用")
     }
 
     var normalizedBaseURL: URL? {
@@ -397,33 +409,64 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     }
     func drafts(in folder: UUID?) -> [PostItem] { drafts.filter { $0.folderID == folder } }
 
+    private func queueLog(_ message: String) {
+        let safeMessage = message.replacingOccurrences(of: #"(?i)(cookie|authorization|csrf|password|token)\s*[:=]\s*[^\s,;]+"#, with: "$1=[REDACTED]", options: .regularExpression)
+        let line = "\(Date().formatted(date: .numeric, time: .standard))  \(safeMessage)"
+        queueLogs.insert(line, at: 0)
+        if queueLogs.count > 500 { queueLogs = Array(queueLogs.prefix(500)) }
+        UserDefaults.standard.set(queueLogs, forKey: "queueLogs")
+        log("QUEUE: \(message)")
+    }
+
     func startQueue(draftIDs: Set<UUID>? = nil) {
         guard queueTask == nil else { return }
         let source: [PostItem]
         if let draftIDs, !draftIDs.isEmpty { source = drafts.filter { draftIDs.contains($0.id) } }
         else { source = drafts(in: selectedFolderID) }
         let batch = Array(source.prefix(max(1, min(queueMaxCount, 50))))
-        guard !batch.isEmpty else { queueProgress = "投稿対象の下書きがありません"; return }
+        guard !batch.isEmpty else { queueProgress = "投稿対象の下書きがありません"; queueLog(queueProgress); return }
+        queueLog("キュー開始: \(batch.count)件 / 間隔 \(Int(queueIntervalSeconds))秒")
         beginLiveActivity(total: batch.count)
         queueTask = Task {
             for (index, item) in batch.enumerated() {
                 if Task.isCancelled { break }
+                queueNextPostAt = nil; queueRemainingSeconds = 0
                 queueProgress = "投稿中 \(index+1)/\(batch.count)"
+                queueLog("投稿開始 \(index+1)/\(batch.count) ・画像 \(item.images.count)枚")
                 await updateLiveActivity(completed: index, total: batch.count, status: queueProgress, nextAt: nil)
-                if !(await post(item)) { queueProgress = "失敗：\(index+1)/\(batch.count)"; break }
+                if !(await post(item)) {
+                    queueProgress = "失敗：\(index+1)/\(batch.count)"
+                    queueLog("投稿失敗 \(index+1)/\(batch.count): \(lastError ?? "詳細不明")")
+                    break
+                }
+                queueLog("投稿成功 \(index+1)/\(batch.count)")
                 await updateLiveActivity(completed: index+1, total: batch.count, status: "完了 \(index+1)/\(batch.count)", nextAt: nil)
                 if index < batch.count-1 {
                     let interval = max(5, min(3600, queueIntervalSeconds))
                     let next = Date().addingTimeInterval(interval)
-                    await updateLiveActivity(completed: index+1, total: batch.count, status: "次の投稿を待機中", nextAt: next)
-                    do { try await Task.sleep(for: .seconds(interval)) } catch { break }
+                    queueNextPostAt = next; queueProgress = "次の投稿を待機中"
+                    await updateLiveActivity(completed: index+1, total: batch.count, status: queueProgress, nextAt: next)
+                    queueLog("次の投稿まで \(Int(interval))秒")
+                    for remaining in stride(from: Int(interval), through: 1, by: -1) {
+                        if Task.isCancelled { break }
+                        queueRemainingSeconds = remaining
+                        do { try await Task.sleep(for: .seconds(1)) } catch { break }
+                    }
+                    queueRemainingSeconds = 0; queueNextPostAt = nil
+                    if Task.isCancelled { break }
                 }
             }
-            if !Task.isCancelled && queueProgress.hasPrefix("投稿中") { queueProgress = "キュー完了" }
-            await endLiveActivity(finalStatus: queueProgress); queueTask = nil
+            if Task.isCancelled { queueProgress = "停止"; queueLog("キュー停止") }
+            else if queueProgress.hasPrefix("投稿中") || queueProgress == "次の投稿を待機中" { queueProgress = "キュー完了"; queueLog("キュー完了") }
+            await endLiveActivity(finalStatus: queueProgress)
+            queueTask = nil; queueNextPostAt = nil; queueRemainingSeconds = 0
         }
     }
-    func stopQueue() { queueTask?.cancel(); queueTask = nil; queueProgress = "停止"; Task { await endLiveActivity(finalStatus: "停止") }; log("キュー停止") }
+    func stopQueue() {
+        queueTask?.cancel(); queueTask = nil; queueNextPostAt = nil; queueRemainingSeconds = 0
+        queueProgress = "停止"; queueLog("キュー停止要求")
+        Task { await endLiveActivity(finalStatus: "停止") }
+    }
     func checkDuePosts() {
         let due = drafts.filter { ($0.scheduledAt ?? .distantFuture) <= Date() }
         guard !due.isEmpty, !isSending else { return }

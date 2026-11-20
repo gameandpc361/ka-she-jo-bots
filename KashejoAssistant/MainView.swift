@@ -12,6 +12,7 @@ struct MainView: View {
     @State private var photos: [PhotosPickerItem] = []
     @State private var imageData: [Data] = []
     @State private var showFilePicker = false
+    @State private var draftDisplayMode = UserDefaults.standard.string(forKey: "draftDisplayMode") ?? "list"
     @State private var scheduleEnabled = false
     @State private var scheduleDate = Calendar.current.date(byAdding: .hour, value: 1, to: Date()) ?? Date()
     @State private var notice: String?
@@ -83,9 +84,9 @@ struct MainView: View {
                 }
                 Section("画像") {
                     HStack {
-                        PhotosPicker(selection: $photos, maxSelectionCount: model.maxImageCount, matching: .images) { Label("写真", systemImage: "photo") }
+                        PhotosPicker(selection: $photos, maxSelectionCount: model.maxImageCount, matching: .images) { Label("写真", systemImage: "photo") }.disabled(imageData.count >= model.maxImageCount)
                         Spacer()
-                        Button { showFilePicker = true } label: { Label("ファイル", systemImage: "folder") }
+                        Button { showFilePicker = true } label: { Label("ファイル", systemImage: "folder") }.disabled(imageData.count >= model.maxImageCount)
                     }
                     Text("\(imageData.count)枚選択済み ・ 最大\(model.maxImageCount)枚").foregroundStyle(.secondary)
                     if !imageData.isEmpty {
@@ -141,28 +142,21 @@ struct MainView: View {
                 }
             }
         }
-        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls):
-                for url in urls.prefix(max(0, model.maxImageCount - imageData.count)) {
-                    let access = url.startAccessingSecurityScopedResource()
-                    defer { if access { url.stopAccessingSecurityScopedResource() } }
-                    do {
-                        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-                        guard CGImageSourceCreateWithData(data as CFData, nil) != nil else { throw AppError.message("画像として読み取れないファイルです") }
-                        imageData.append(data)
-                        model.log("Files画像読込成功: name=\(url.lastPathComponent) bytes=\(data.count)")
-                    } catch {
-                        model.log("Files画像読込失敗: name=\(url.lastPathComponent) error=\(error.localizedDescription)")
-                        notice = "ファイルを読み込めませんでした（\(url.lastPathComponent)）: \(error.localizedDescription)"
-                    }
+        .sheet(isPresented: $showFilePicker) {
+            ImageDocumentPicker(maxSelection: max(0, model.maxImageCount - imageData.count)) { result in
+                switch result {
+                case .success(let files):
+                    imageData.append(contentsOf: files.prefix(max(0, model.maxImageCount - imageData.count)))
+                    model.log("UIDocumentPicker読込完了: \(files.count)件")
+                    showImageWarnings()
+                case .failure(let error):
+                    model.log("UIDocumentPicker失敗: \(error.localizedDescription)")
+                    notice = "ファイルを読み込めませんでした: \(error.localizedDescription)"
                 }
-                showImageWarnings()
-            case .failure(let error):
-                model.log("Files選択画面エラー: \(error.localizedDescription)")
-                notice = "ファイル選択エラー: \(error.localizedDescription)"
             }
+            .ignoresSafeArea()
         }
+
     }
     private func clearComposer() { bodyText = ""; imageData = []; photos = []; scheduleEnabled = false; focused = false }
     private func imageDescription(_ data: Data) -> String {
@@ -191,55 +185,69 @@ struct MainView: View {
     private var draftsTab: some View {
         NavigationStack {
             List {
-                Section("キューフォルダ") {
-                    Picker("対象フォルダ", selection: Binding(get: { model.selectedFolderID ?? UUID.zero }, set: { model.selectedFolderID = $0 == UUID.zero ? nil : $0 })) {
+                Section {
+                    HStack {
+                        Label("フォルダ階層", systemImage: "folder.tree").font(.headline)
+                        Spacer()
+                        Button { showNewFolder = true } label: { Label("新規", systemImage: "folder.badge.plus") }
+                    }
+                    Picker("表示フォルダ", selection: Binding(get: { model.selectedFolderID ?? UUID.zero }, set: { model.selectedFolderID = $0 == UUID.zero ? nil : $0 })) {
                         Text("未分類").tag(UUID.zero)
                         ForEach(model.folders) { folder in Text(model.folderPath(folder)).tag(folder.id) }
                     }
-                    Button { showNewFolder = true } label: { Label(model.selectedFolderID == nil ? "フォルダを作成" : "選択フォルダ内にサブフォルダを作成", systemImage: "folder.badge.plus") }
                     if let selected = model.selectedFolderID, model.folders.contains(where: { $0.id == selected }) {
                         Button("選択フォルダと配下を削除", role: .destructive) { model.deleteFolder(selected); selectedDraftIDs.removeAll() }
                     }
-                    Text("このフォルダに新しく保存した下書きがキュー対象になります。別フォルダの下書きは投稿しません。").font(.caption).foregroundStyle(.secondary)
-                }
-                Section("下書き（\(model.drafts.count)件）") {
+                    Text("選択中: \(model.selectedFolderID.flatMap { id in model.folders.first(where: {$0.id == id}).map { model.folderPath($0) } } ?? "未分類") ・下書き \(model.drafts(in: model.selectedFolderID).count)件")
+                        .font(.caption).foregroundStyle(.secondary)
+                } header: { Text("1. フォルダ") }
+
+                Section {
+                    HStack { VStack(alignment: .leading, spacing: 4) {
+                        Text(model.queueProgress).font(.headline)
+                        if let next = model.queueNextPostAt {
+                            Text("次の投稿まで：\(model.queueRemainingSeconds / 60)分 \(model.queueRemainingSeconds % 60)秒")
+                            Text("予定時刻：\(next.formatted(date: .omitted, time: .shortened))").font(.caption).foregroundStyle(.secondary)
+                        } else { Text("投稿間隔：\(Int(model.queueIntervalSeconds))秒").font(.caption).foregroundStyle(.secondary) }
+                    }; Spacer(); if model.queueProgress.contains("投稿中") { ProgressView() } }
+                    Button("このフォルダを順番に投稿") { model.startQueue() }
+                    if !selectedDraftIDs.isEmpty { Button("選択した\(selectedDraftIDs.count)件を順番に投稿") { model.startQueue(draftIDs: selectedDraftIDs) } }
+                    Button("キュー停止", role: .destructive) { model.stopQueue() }
+                    NavigationLink { QueueLogView(model: model) } label: { Label("連続投稿キューのログ（\(model.queueLogs.count)件）", systemImage: "text.alignleft") }
+                    Text("最大 \(model.queueMaxCount)件。投稿処理はアプリを前面に置いている間に実行します。")
+                        .font(.caption).foregroundStyle(.secondary)
+                } header: { Text("2. 連続投稿キュー") }
+
+                Section {
                     HStack {
-                        Button(selectedDraftIDs.count == model.drafts.count && !model.drafts.isEmpty ? "すべて解除" : "すべて選択") {
-                            if selectedDraftIDs.count == model.drafts.count { selectedDraftIDs.removeAll() } else { selectedDraftIDs = Set(model.drafts.map(\.id)) }
+                        Text("下書き（\(model.drafts(in: model.selectedFolderID).count)件）").font(.headline)
+                        Spacer()
+                        Picker("表示", selection: $draftDisplayMode) {
+                            Text("リスト").tag("list")
+                            Text("カード").tag("cards")
+                        }.pickerStyle(.segmented).frame(width: 150)
+                        .onChange(of: draftDisplayMode) { _, v in UserDefaults.standard.set(v, forKey: "draftDisplayMode") }
+                    }
+                    HStack {
+                        Button(selectedDraftIDs.count == model.drafts(in: model.selectedFolderID).count && !model.drafts(in: model.selectedFolderID).isEmpty ? "すべて解除" : "すべて選択") {
+                            let ids = Set(model.drafts(in: model.selectedFolderID).map(\.id))
+                            if selectedDraftIDs == ids { selectedDraftIDs.subtract(ids) } else { selectedDraftIDs.formUnion(ids) }
                         }
-                        if !selectedDraftIDs.isEmpty { Button("選択した\(selectedDraftIDs.count)件を削除", role: .destructive) { model.deleteDrafts(selectedDraftIDs); selectedDraftIDs.removeAll() } }
+                        if !selectedDraftIDs.isEmpty { Button("削除（\(selectedDraftIDs.count)）", role: .destructive) { model.deleteDrafts(selectedDraftIDs); selectedDraftIDs.removeAll() } }
                     }
                     if !selectedDraftIDs.isEmpty {
-                        Button("選択した\(selectedDraftIDs.count)件をこのフォルダへ移動") {
-                            model.moveDrafts(selectedDraftIDs, to: model.selectedFolderID); selectedDraftIDs.removeAll()
-                        }
+                        Button("選択した下書きをこのフォルダへ移動") { model.moveDrafts(selectedDraftIDs, to: model.selectedFolderID); selectedDraftIDs.removeAll() }
                     }
-                    let items = model.drafts
+                    let items = model.drafts(in: model.selectedFolderID)
                     if items.isEmpty { ContentUnavailableView("下書きはありません", systemImage: "doc.text") }
                     ForEach(items) { item in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Button {
-                                    if selectedDraftIDs.contains(item.id) { selectedDraftIDs.remove(item.id) } else { selectedDraftIDs.insert(item.id) }
-                                } label: { Label(selectedDraftIDs.contains(item.id) ? "選択済み" : "選択", systemImage: selectedDraftIDs.contains(item.id) ? "checkmark.circle.fill" : "circle") }.buttonStyle(.bordered)
-                                Text(model.folders.first(where: { $0.id == item.folderID }).map { model.folderPath($0) } ?? "未分類").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Text(item.body.isEmpty ? "（本文なし）" : item.body).lineLimit(3)
-                            Text("画像 \(item.images.count)枚 ・ \(item.scheduledAt?.formatted(date: .numeric, time: .shortened) ?? "未予約")").font(.caption).foregroundStyle(.secondary)
-                            if !item.images.isEmpty { ScrollView(.horizontal) { HStack { ForEach(Array(item.images.prefix(5).enumerated()), id: \.offset) { _, d in AnimatedImagePreview(data: d).frame(width: 68, height: 58).clipShape(RoundedRectangle(cornerRadius: 6)) } } } }
-                            HStack { Button("投稿") { Task { let ok = await model.post(item); notice = ok ? "投稿しました" : (model.lastError ?? "失敗") } }; Button("削除", role: .destructive) { model.deleteDraft(item) } }.buttonStyle(.bordered)
-                        }
+                        DraftRow(item: item, selected: selectedDraftIDs.contains(item.id), card: draftDisplayMode == "cards", onSelect: {
+                            if selectedDraftIDs.contains(item.id) { selectedDraftIDs.remove(item.id) } else { selectedDraftIDs.insert(item.id) }
+                        }, onPost: { Task { let ok = await model.post(item); notice = ok ? "投稿しました" : (model.lastError ?? "失敗") } }, onDelete: { model.deleteDraft(item) })
                     }
-                }
-                Section("連続投稿キュー") {
-                    Text("現在のフォルダ: \(model.folders.first(where: { $0.id == model.selectedFolderID })?.name ?? "未分類")").font(.caption).foregroundStyle(.secondary)
-                    Text(model.queueProgress).font(.caption)
-                    Button("このフォルダを順番に投稿") { model.startQueue() }
-                    if !selectedDraftIDs.isEmpty { Button("選択した\(selectedDraftIDs.count)件だけを順番に投稿") { model.startQueue(draftIDs: selectedDraftIDs) } }
-                    Button("キュー停止", role: .destructive) { model.stopQueue() }
-                    Text("投稿間隔は5〜3600秒、1回のキューは最大50件です。アプリを前面に置いて使用してください。").font(.footnote).foregroundStyle(.secondary)
-                }
-            }.navigationTitle("下書き・キュー")
+                } header: { Text("3. 下書き一覧") }
+            }
+            .navigationTitle("下書き・キュー")
         }
     }
 
@@ -296,6 +304,18 @@ struct MainView: View {
                     LabeledContent("現在のWebView URL") { Text(model.currentWebURLString).font(.caption).textSelection(.enabled).multilineTextAlignment(.trailing) }
                     Button("現在のURLをコピー") { UIPasteboard.general.string = model.currentWebURLString }
                     Text("投稿はWebView内の実際のフォームを使用し、APIエンドポイントには送信しません。").font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("WebView / User-Agent") {
+                    Text("現在のUser-Agent")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(model.webView.customUserAgent ?? "iOS標準（WKWebView既定）")
+                        .font(.caption2).textSelection(.enabled)
+                    TextField("カスタムUser-Agent（空欄で標準）", text: $model.customUserAgent, axis: .vertical)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Button("標準User-Agentに戻す") { model.customUserAgent = ""; model.webView.reload() }
+                    Button("User-Agentを適用して再読み込み") { model.applyUserAgent(); model.webView.reload() }
+                    Text("User-Agentの変更はWebサイトの表示や互換性に影響する場合があります。")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("キュー") {
                     HStack {
@@ -357,10 +377,82 @@ struct MainView: View {
                     LabeledContent("アプリ", value: "Kashejo Assistant")
                     LabeledContent("バージョン", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "未設定")
                     LabeledContent("ビルド", value: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "未設定")
+                    NavigationLink { SystemInfoView() } label: { Label("システム情報", systemImage: "cpu") }
                     Link(destination: URL(string: "https://github.com/gameandpc361/ka-she-jo-bots")!) { Label("GitHub リポジトリ", systemImage: "link") }
                 }
             }
             .navigationTitle("More")
+        }
+    }
+}
+
+struct DraftRow: View {
+    let item: PostItem; let selected: Bool; let card: Bool
+    let onSelect: () -> Void; let onPost: () -> Void; let onDelete: () -> Void
+    var body: some View {
+        Group {
+            if card {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack { Button(action: onSelect) { Image(systemName: selected ? "checkmark.circle.fill" : "circle") }; Spacer(); Text(item.createdAt.formatted(date: .numeric, time: .shortened)).font(.caption).foregroundStyle(.secondary) }
+                    Text(item.body.isEmpty ? "（本文なし）" : item.body).lineLimit(5)
+                    if !item.images.isEmpty { ScrollView(.horizontal) { HStack { ForEach(Array(item.images.prefix(5).enumerated()), id: \.offset) { _, data in AnimatedImagePreview(data: data).frame(width: 100, height: 82).clipShape(RoundedRectangle(cornerRadius: 8)) } } } }
+                    Text("画像 \(item.images.count)枚").font(.caption).foregroundStyle(.secondary)
+                    HStack { Button("投稿", action: onPost).buttonStyle(.borderedProminent); Button("削除", role: .destructive, action: onDelete).buttonStyle(.bordered) }
+                }.padding(10).background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            } else {
+                HStack(alignment: .top, spacing: 10) {
+                    Button(action: onSelect) { Image(systemName: selected ? "checkmark.circle.fill" : "circle").font(.title3) }
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(item.body.isEmpty ? "（本文なし）" : item.body).lineLimit(2)
+                        Text("画像 \(item.images.count)枚 ・ \(item.createdAt.formatted(date: .numeric, time: .shortened))").font(.caption).foregroundStyle(.secondary)
+                        HStack { Button("投稿", action: onPost); Button("削除", role: .destructive, action: onDelete) }.buttonStyle(.bordered).font(.caption)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct QueueLogView: View {
+    @ObservedObject var model: AppModel
+    var body: some View { List { if model.queueLogs.isEmpty { ContentUnavailableView("キューログはありません", systemImage: "text.alignleft") }; ForEach(Array(model.queueLogs.enumerated()), id: \.offset) { _, line in Text(line).font(.system(.caption, design: .monospaced)).textSelection(.enabled) } }.navigationTitle("キューログ") }
+}
+
+struct ImageDocumentPicker: UIViewControllerRepresentable {
+    let maxSelection: Int
+    let completion: (Result<[Data], Error>) -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(completion: completion) }
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.image], asCopy: true)
+        picker.allowsMultipleSelection = maxSelection > 1
+        picker.delegate = context.coordinator
+        return picker
+    }
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let completion: (Result<[Data], Error>) -> Void
+        init(completion: @escaping (Result<[Data], Error>) -> Void) { self.completion = completion }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { completion(.success([])) }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            do {
+                var loaded: [Data] = []
+                for url in urls {
+                    let access = url.startAccessingSecurityScopedResource()
+                    defer { if access { url.stopAccessingSecurityScopedResource() } }
+                    var coordinationError: NSError?
+                    var readError: Error?
+                    var data: Data?
+                    let coordinator = NSFileCoordinator(filePresenter: nil)
+                    coordinator.coordinate(readingItemAt: url, options: .withoutChanges, error: &coordinationError) { safeURL in
+                        do { data = try Data(contentsOf: safeURL) } catch { readError = error }
+                    }
+                    if let coordinationError { throw coordinationError }
+                    if let readError { throw readError }
+                    guard let bytes = data, CGImageSourceCreateWithData(bytes as CFData, nil) != nil else { throw AppError.message("画像データとして読み取れないファイルがあります: \(url.lastPathComponent)") }
+                    loaded.append(bytes)
+                }
+                completion(.success(loaded))
+            } catch { completion(.failure(error)) }
         }
     }
 }
