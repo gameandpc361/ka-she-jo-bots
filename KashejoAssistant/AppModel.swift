@@ -269,37 +269,43 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
                 let type = imageType(data)
                 return ["base64": data.base64EncodedString(), "mime": type.mime, "filename": "kashejo-image-\(i+1).\(type.ext)"]
             }
-            let args: [String: Any] = ["bodyText": item.body, "files": files]
-            let js = """
-            const forms = Array.from(document.forms);
-            const form = forms.find(f => f.querySelector('[name="csrf"]') && f.querySelector('[name="body"]'));
-            if (!form) return {ok:false, stage:'form-not-found', status:0, error:'このページに投稿フォームがありません。通常の投稿画面を開いてください。'};
-            const action = new URL(form.getAttribute('action') || location.href, location.href);
-            if (action.origin !== location.origin) return {ok:false, stage:'origin-check', status:0, error:'投稿フォームの送信先が異なるため中止しました。'};
-            const fd = new FormData(form);
-            fd.set('body', bodyText);
-            fd.delete('images');
-            for (const f of files) {
-              const raw = atob(f.base64); const bytes = new Uint8Array(raw.length);
-              for (let j=0; j<raw.length; j++) bytes[j] = raw.charCodeAt(j);
-              fd.append('images', new File([bytes], f.filename, {type:f.mime}));
+            // Catch errors inside JavaScript so WKWebView returns the actual stage/message.
+            let js = #"""
+            try {
+              const forms = Array.from(document.forms);
+              const form = forms.find(f => f.querySelector('[name="csrf"]') && f.querySelector('[name="body"]'));
+              if (!form) return {ok:false, stage:'form-not-found', status:0, error:'このページに投稿フォームがありません。Kashejoの通常投稿画面を開いてください。'};
+              const action = new URL(form.getAttribute('action') || location.href, location.href);
+              if (action.origin !== location.origin) return {ok:false, stage:'origin-check', status:0, error:'投稿フォームの送信先が異なるため中止しました。'};
+              const method = (form.method || 'POST').toUpperCase();
+              if (method !== 'POST') return {ok:false, stage:'method-check', status:0, error:'投稿フォームがPOSTではありません: '+method};
+              const fd = new FormData(form);
+              fd.set('body', bodyText);
+              fd.delete('images');
+              for (const f of files) {
+                const raw = atob(f.base64); const bytes = new Uint8Array(raw.length);
+                for (let j=0; j<raw.length; j++) bytes[j] = raw.charCodeAt(j);
+                fd.append('images', new File([bytes], f.filename, {type:f.mime}));
+              }
+              const started = performance.now();
+              const response = await fetch(action.href, {method:'POST', body:fd, credentials:'same-origin', redirect:'follow'});
+              const elapsed = Math.round(performance.now()-started);
+              const finalURL = response.url || action.href;
+              const path = new URL(finalURL).pathname;
+              const successPath = /\/posts\/\d+\/?$/.test(path);
+              const rawText = successPath ? '' : await response.clone().text();
+              const safeText = rawText.replace(/(csrf|authenticity_token|password|cookie|authorization)[^\n]{0,160}/ig, '$1=[REDACTED]').slice(0,1600);
+              return {ok:response.ok && successPath, stage:'web-form-fetch', status:response.status, url:finalURL, elapsed, responseBytes:rawText.length, responsePreview:safeText, method, actionPath:new URL(action.href).pathname, fileCount:files.length, error:response.ok && successPath ? '' : (safeText || 'HTTP '+response.status+'。投稿完了ページを確認できませんでした')};
+            } catch (e) {
+              return {ok:false, stage:'javascript-catch', status:0, error:String(e && e.message || e), stack:String(e && e.stack || '').slice(0,1200), pageURL:location.href};
             }
-            const method = (form.method || 'POST').toUpperCase();
-            const started = performance.now();
-            const response = await fetch(action.href, {method, body:fd, credentials:'same-origin', redirect:'follow'});
-            const elapsed = Math.round(performance.now()-started);
-            const finalURL = response.url || action.href;
-            const p = new URL(finalURL).pathname.split('/').filter(Boolean);
-            const tail = p[p.length-1] || '';
-            const successPath = p[p.length-2] === 'posts' && /^\\d+$/.test(tail);
-            const rawText = successPath ? '' : await response.clone().text();
-            const safeText = rawText.replace(/(csrf|authenticity_token|password|cookie|authorization)[^\\n]{0,160}/ig, '$1=[REDACTED]').slice(0,1200);
-            return {ok:response.ok && successPath, stage:'web-form', status:response.status, url:finalURL, elapsed, responseBytes:rawText.length, responsePreview:safeText, method, actionPath:new URL(action.href).pathname, fileCount:files.length, error:response.ok && successPath ? '' : (safeText || '投稿完了ページを確認できませんでした')};
-            """
+            """#
             let result = try await webView.callAsyncJavaScript(js, arguments: ["bodyText": item.body, "files": files], in: nil, contentWorld: .page)
-            guard let d = result as? [String: Any] else { throw AppError.message("投稿応答の形式が不正です") }
+            guard let d = result as? [String: Any] else { throw AppError.message("投稿応答の形式が不正です。WebViewのURLと投稿フォームを確認してください。") }
             let code = d["status"] as? Int ?? 0
-            log("送信詳細 method=\(d["method"] as? String ?? "POST") path=\(d["actionPath"] as? String ?? "?") HTTP=\(code) elapsed=\(d["elapsed"] ?? "?")ms images=\(d["fileCount"] ?? 0) responseBytes=\(d["responseBytes"] ?? 0)")
+            let stage = d["stage"] as? String ?? "unknown"
+            log("送信詳細 stage=\(stage) method=\(d["method"] as? String ?? "-") path=\(d["actionPath"] as? String ?? "?") HTTP=\(code) elapsed=\(d["elapsed"] ?? "?")ms images=\(d["fileCount"] ?? 0)")
+            if let stack = d["stack"] as? String, !stack.isEmpty { log("JavaScript stack: \(stack)") }
             if let preview = d["responsePreview"] as? String, !preview.isEmpty { log("応答プレビュー（先頭・機密語をマスク）: \(preview)") }
             guard d["ok"] as? Bool == true else { lastError = d["error"] as? String ?? "投稿に失敗しました"; status = "投稿失敗"; log("投稿失敗: \(lastError ?? "unknown")"); return false }
             let raw = d["url"] as? String ?? ""
@@ -307,7 +313,41 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
             history.insert(HistoryItem(body: item.body, resultURL: resolved, imageCount: item.images.count), at: 0)
             drafts.removeAll { $0.id == item.id }; persist(); status = "投稿成功"; log("投稿成功。履歴に保存")
             return true
-        } catch { lastError = error.localizedDescription; status = "投稿失敗"; log("投稿例外: \(error.localizedDescription)"); return false }
+        } catch {
+            lastError = error.localizedDescription; status = "投稿失敗"; log("投稿例外: \(error.localizedDescription)"); return false
+        }
+    }
+
+    var currentWebURLString: String { webView.url?.absoluteString ?? "未読込" }
+
+    func detectAccountIDFromWebPage() async {
+        guard webView.url?.host == normalizedBaseURL?.host else { lastError = "先にKashejoのWeb画面を開いてください"; return }
+        let js = #"""
+        (() => {
+          const found = new Set();
+          const add = value => {
+            if (!value) return;
+            try {
+              const u = new URL(value, location.href);
+              const paths = u.pathname.split('/').filter(Boolean);
+              for (let i=0; i<paths.length-1; i++) if (paths[i] === 'a' && /^\d+$/.test(paths[i+1])) found.add(paths[i+1]);
+              for (let i=0; i<paths.length-1; i++) if (/^(account|accounts|user|users|profile|profiles)$/.test(paths[i]) && /^\d+$/.test(paths[i+1])) found.add(paths[i+1]);
+            } catch (_) {}
+          };
+          add(location.href);
+          if (found.size === 1) return {ids:Array.from(found), url:location.href, title:document.title, source:'current-url'};
+          document.querySelectorAll('a[href], form[action]').forEach(e => add(e.href || e.action));
+          return {ids:Array.from(found), url:location.href, title:document.title, source:'page-links'};
+        })()
+        """#
+        do {
+            let result = try await webView.callAsyncJavaScript("return " + js, arguments: [:], in: nil, contentWorld: .page)
+            let dict = result as? [String: Any]
+            let ids = dict?["ids"] as? [String] ?? []
+            if ids.count == 1, let id = ids.first { accountID = id; lastError = nil; log("アカウントIDをWeb画面から取得: \(id)") }
+            else if ids.count > 1 { lastError = "複数のID候補が見つかりました: \(ids.joined(separator: ", "))。プロフィール画面を開いて再取得してください。"; log("アカウントID候補が複数: \(ids.joined(separator: ","))") }
+            else { lastError = "現在の画面からアカウントIDを特定できません。プロフィールまたは自分の投稿画面を開いてください。"; log("アカウントID取得失敗: DOM内にID候補なし") }
+        } catch { lastError = "ID取得エラー: \(error.localizedDescription)"; log("アカウントID取得エラー: \(error.localizedDescription)") }
     }
 
     func saveDraft(body: String, images: [Data], scheduledAt: Date? = nil, folderID: UUID? = nil) {

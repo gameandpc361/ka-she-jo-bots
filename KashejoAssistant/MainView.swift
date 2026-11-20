@@ -43,25 +43,6 @@ struct MainView: View {
         }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.checkDuePosts(); Task { await model.checkSession() } } }
         .alert("お知らせ", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) { Button("OK") { notice = nil } } message: { Text(notice ?? "") }
-        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls):
-                for url in urls.prefix(max(0, model.maxImageCount - imageData.count)) {
-                    let access = url.startAccessingSecurityScopedResource()
-                    defer { if access { url.stopAccessingSecurityScopedResource() } }
-                    do {
-                        var readError: NSError?
-                        var loaded: Data?
-                        NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: url, options: [], error: &readError) { coordinatedURL in loaded = try? Data(contentsOf: coordinatedURL, options: [.mappedIfSafe]) }
-                        if let readError { throw readError }
-                        guard let data = loaded, CGImageSourceCreateWithData(data as CFData, nil) != nil else { throw AppError.message("画像として読み取れないファイルです") }
-                        imageData.append(data); model.log("Files画像読込: name=\(url.lastPathComponent) bytes=\(data.count)")
-                    } catch { notice = "ファイルを読み込めませんでした（\(url.lastPathComponent)）: \(error.localizedDescription)" }
-                }
-                showImageWarnings()
-            case .failure(let error): notice = "ファイル選択エラー: \(error.localizedDescription)"
-            }
-        }
         .sheet(isPresented: $showNewFolder) {
             NavigationStack { Form { TextField("フォルダ名", text: $newFolderName) }
                 .navigationTitle("キューフォルダ作成")
@@ -160,6 +141,28 @@ struct MainView: View {
                 }
             }
         }
+        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                for url in urls.prefix(max(0, model.maxImageCount - imageData.count)) {
+                    let access = url.startAccessingSecurityScopedResource()
+                    defer { if access { url.stopAccessingSecurityScopedResource() } }
+                    do {
+                        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+                        guard CGImageSourceCreateWithData(data as CFData, nil) != nil else { throw AppError.message("画像として読み取れないファイルです") }
+                        imageData.append(data)
+                        model.log("Files画像読込成功: name=\(url.lastPathComponent) bytes=\(data.count)")
+                    } catch {
+                        model.log("Files画像読込失敗: name=\(url.lastPathComponent) error=\(error.localizedDescription)")
+                        notice = "ファイルを読み込めませんでした（\(url.lastPathComponent)）: \(error.localizedDescription)"
+                    }
+                }
+                showImageWarnings()
+            case .failure(let error):
+                model.log("Files選択画面エラー: \(error.localizedDescription)")
+                notice = "ファイル選択エラー: \(error.localizedDescription)"
+            }
+        }
     }
     private func clearComposer() { bodyText = ""; imageData = []; photos = []; scheduleEnabled = false; focused = false }
     private func imageDescription(_ data: Data) -> String {
@@ -181,7 +184,7 @@ struct MainView: View {
         NavigationStack {
             WebLoginView(webView: model.webView).navigationTitle("Kashejo Web").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItemGroup(placement: .topBarTrailing) { Button { model.openHomePage() } label: { Image(systemName: "house") }; Button { model.webView.reload() } label: { Image(systemName: "arrow.clockwise") }; Button { Task { await model.checkSession() } } label: { Image(systemName: "person.crop.circle.badge.checkmark") } } }
-                .safeAreaInset(edge: .bottom) { HStack { Text(model.status).font(.caption).lineLimit(1); Spacer(); Button("確認") { Task { await model.checkSession() } } }.padding().background(.bar) }
+                .safeAreaInset(edge: .bottom) { VStack(alignment: .leading, spacing: 4) { Text(model.status).font(.caption).lineLimit(1); Text(model.currentWebURLString).font(.caption2).lineLimit(2).textSelection(.enabled); HStack { Spacer(); Button("URLコピー") { UIPasteboard.general.string = model.currentWebURLString }; Button("確認") { Task { await model.checkSession() } } } }.padding().background(.bar) }
         }.onAppear { if model.webView.url == nil { model.openHomePage() } }
     }
 
@@ -286,18 +289,38 @@ struct MainView: View {
             Form {
                 Section("接続") {
                     TextField("サイトURL", text: $model.siteBaseURL).textInputAutocapitalization(.never).keyboardType(.URL).autocorrectionDisabled()
-                    TextField("アカウントID（表示/確認用）", text: $model.accountID).keyboardType(.numberPad)
+                    TextField("アカウントID", text: $model.accountID).keyboardType(.numberPad)
+                    Button("Web画面からアカウントIDを自動取得") { Task { await model.detectAccountIDFromWebPage() } }
+                    Text("APIは使用せず、現在のWebView内のURLとリンクからID候補を読み取ります。プロフィール/自分の投稿画面で実行してください。").font(.footnote).foregroundStyle(.secondary)
                     Button("トップページを開く") { model.openHomePage() }
+                    LabeledContent("現在のWebView URL") { Text(model.currentWebURLString).font(.caption).textSelection(.enabled).multilineTextAlignment(.trailing) }
+                    Button("現在のURLをコピー") { UIPasteboard.general.string = model.currentWebURLString }
                     Text("投稿はWebView内の実際のフォームを使用し、APIエンドポイントには送信しません。").font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("キュー") {
-                    LabeledContent("投稿間隔", value: "\(Int(model.queueIntervalSeconds))秒")
+                    HStack {
+                        Text("投稿間隔")
+                        Spacer()
+                        TextField("秒", value: Binding(get: { Int(model.queueIntervalSeconds) }, set: { model.queueIntervalSeconds = Double(min(max($0, 5), 3600)) }), format: .number)
+                            .keyboardType(.numberPad).multilineTextAlignment(.trailing).frame(width: 100)
+                        Text("秒")
+                    }
                     Slider(value: $model.queueIntervalSeconds, in: 5...3600, step: 1)
-                    LabeledContent("1回の最大件数", value: "\(model.queueMaxCount)件")
+                    HStack {
+                        Text("1回の最大件数")
+                        Spacer()
+                        TextField("件", value: Binding(get: { model.queueMaxCount }, set: { model.queueMaxCount = min(max($0, 1), 50) }), format: .number).keyboardType(.numberPad).multilineTextAlignment(.trailing).frame(width: 100)
+                        Text("件")
+                    }
                     Slider(value: Binding(get: { Double(model.queueMaxCount) }, set: { model.queueMaxCount = Int($0) }), in: 1...50, step: 1)
                 }
                 Section("画像") {
-                    LabeledContent("最大枚数", value: "\(model.maxImageCount)枚")
+                    HStack {
+                        Text("最大枚数")
+                        Spacer()
+                        TextField("枚", value: Binding(get: { model.maxImageCount }, set: { model.maxImageCount = min(max($0, 1), 20) }), format: .number).keyboardType(.numberPad).multilineTextAlignment(.trailing).frame(width: 100)
+                        Text("枚")
+                    }
                     Slider(value: Binding(get: { Double(model.maxImageCount) }, set: { model.maxImageCount = Int($0) }), in: 1...20, step: 1)
                     Text("10MiB超過は警告のみ。GIF/PNG/JPEG等の元データをできるだけ保持します。").font(.footnote).foregroundStyle(.secondary)
                 }
