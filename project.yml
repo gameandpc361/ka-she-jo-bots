@@ -9,6 +9,8 @@ targets:
     platform: iOS
     sources:
       - KashejoAssistant
+    dependencies:
+      - target: KashejoLiveActivity
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.example.KashejoAssistant
@@ -20,3 +22,31 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         CODE_SIGN_STYLE: Automatic
+    info:
+      properties:
+        NSSupportsLiveActivities: true
+        BGTaskSchedulerPermittedIdentifiers:
+          - jp.example.KashejoAssistant.queue-refresh
+        UIBackgroundModes:
+          - fetch
+  KashejoLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - KashejoLiveActivity
+      - KashejoAssistant/ActivityAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.example.KashejoAssistant.LiveActivity
+        PRODUCT_NAME: KashejoLiveActivity
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Kashejo Live Activity
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Automatic
+    info:
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
