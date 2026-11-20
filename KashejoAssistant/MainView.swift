@@ -83,11 +83,28 @@ struct MainView: View {
                     HStack { Text("{random} は8文字、{random:数字} は指定文字数の英数字に置換").font(.caption).foregroundStyle(.secondary); Spacer(); Button("キーボードを閉じる") { focused = false; UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }.font(.caption) }
                 }
                 Section("画像") {
-                    HStack {
-                        PhotosPicker(selection: $photos, maxSelectionCount: model.maxImageCount, matching: .images) { Label("写真", systemImage: "photo") }.disabled(imageData.count >= model.maxImageCount)
-                        Spacer()
-                        Button { showFilePicker = true } label: { Label("ファイル", systemImage: "folder") }.disabled(imageData.count >= model.maxImageCount)
+                    VStack(alignment: .leading, spacing: 12) {
+                        PhotosPicker(selection: $photos, maxSelectionCount: max(1, model.maxImageCount - imageData.count), matching: .images) {
+                            Label("写真アプリから選択", systemImage: "photo")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .disabled(imageData.count >= model.maxImageCount)
+
+                        Button { showFilePicker = true } label: {
+                            Label("ファイルアプリから選択", systemImage: "folder")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .disabled(imageData.count >= model.maxImageCount)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("写真アプリとファイルアプリは別々のボタンです。どちらからも画像を追加できます。")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("\(imageData.count)枚選択済み ・ 最大\(model.maxImageCount)枚").foregroundStyle(.secondary)
                     if !imageData.isEmpty {
                         ScrollView(.horizontal) {
