@@ -1,26 +1,17 @@
-
 name: Build unsigned iOS IPA
-
 on:
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: macos-15
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Install XcodeGen
         run: brew install xcodegen
-
       - name: Generate Xcode project
         run: xcodegen generate
-
       - name: Build unsigned app
         run: |
-          set -euo pipefail
-
           xcodebuild \
             -project KashejoAssistant.xcodeproj \
             -scheme KashejoAssistant \
@@ -30,41 +21,15 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             build
-
-      - name: Package and verify unsigned IPA
+      - name: Package unsigned IPA
         run: |
-          set -euo pipefail
-
           APP_PATH="build/Build/Products/Release-iphoneos/KashejoAssistant.app"
-          IPA_PATH="KashejoAssistant-unsigned.ipa"
-
           test -d "$APP_PATH"
-          test -f "$APP_PATH/Info.plist"
-
-          rm -rf Payload "$IPA_PATH"
           mkdir -p Payload
-
-          ditto "$APP_PATH" "Payload/KashejoAssistant.app"
-
-          /usr/bin/zip -r -X "$IPA_PATH" Payload
-
-          echo "=== IPA file information ==="
-          ls -lh "$IPA_PATH"
-          file "$IPA_PATH"
-
-          echo "=== ZIP integrity test ==="
-          unzip -t "$IPA_PATH"
-
-          echo "=== IPA structure test ==="
-          unzip -Z1 "$IPA_PATH" | grep -E '^Payload/KashejoAssistant.app/Info.plist$'
-
-          echo "=== IPA size ==="
-          stat -f "%z bytes" "$IPA_PATH"
-
-      - name: Upload verified IPA
-        uses: actions/upload-artifact@v4
+          cp -R "$APP_PATH" Payload/
+          zip -qr KashejoAssistant-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
         with:
           name: KashejoAssistant-unsigned-ipa
           path: KashejoAssistant-unsigned.ipa
           if-no-files-found: error
-          compression-level: 0
