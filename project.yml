@@ -15,8 +15,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.example.KashejoAssistant
         PRODUCT_NAME: KashejoAssistant
-        MARKETING_VERSION: "1.1.2"
-        CURRENT_PROJECT_VERSION: "8"
+        MARKETING_VERSION: "1.1.3"
+        CURRENT_PROJECT_VERSION: "9"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1"

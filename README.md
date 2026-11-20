@@ -1,4 +1,8 @@
-# Kashejo Assistant 1.1.2 (build 8)
+# Kashejo Assistant 1.1.3 (build 9)
+
+## v1.1.3 の変更
+- 写真アプリとファイルアプリの選択ボタンを縦並びの独立した大きなボタンに分離。タップ領域が重ならないように変更。
+- 写真Pickerの選択可能枚数を、すでに追加済みの画像数を差し引いた残り枚数に合わせる。
 
 ## v1.1.2 の変更
 - Filesの画像選択をSwiftUI fileImporterからUIDocumentPickerViewControllerへ変更。Filesの場所（このiPhone内、iCloud Drive、接続済みファイルプロバイダ等）から画像を選べるようにし、複数選択・セキュリティスコープ・NSFileCoordinatorで読み込み。
