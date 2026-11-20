@@ -1,0 +1,22 @@
+name: KashejoAssistant
+options:
+  bundleIdPrefix: jp.example
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  KashejoAssistant:
+    type: application
+    platform: iOS
+    sources:
+      - KashejoAssistant
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.example.KashejoAssistant
+        PRODUCT_NAME: KashejoAssistant
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Kashejo Assistant
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        CODE_SIGN_STYLE: Automatic
