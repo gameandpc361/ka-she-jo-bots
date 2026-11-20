@@ -80,7 +80,8 @@ struct MainView: View {
     }
 
     private var composeView: some View {
-        NavigationStack {
+        let imageLimit = model.maxImageCount
+        return NavigationStack {
             Form {
                 Section("投稿本文") {
                     TextEditor(text: $bodyText)
@@ -88,8 +89,8 @@ struct MainView: View {
                         .frame(minHeight: 120)
                 }
                 Section("画像") {
-                    PhotosPicker(selection: $selectedPhotos, maxSelectionCount: model.maxImageCount, matching: .images) {
-                        Label("写真を最大\(model.maxImageCount)枚選択", systemImage: "photo.on.rectangle.angled")
+                    PhotosPicker(selection: $selectedPhotos, maxSelectionCount: imageLimit, matching: .images) {
+                        Label("写真を最大\(imageLimit)枚選択", systemImage: "photo.on.rectangle.angled")
                     }
                     Text("\(imageData.count) 枚選択済み").foregroundStyle(.secondary)
                     if !imageData.isEmpty {

@@ -32,7 +32,7 @@ enum AppError: LocalizedError {
 }
 
 @MainActor
-final class AppModel: ObservableObject, WKNavigationDelegate {
+final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var webView: WKWebView
     @Published var drafts: [PostItem] = []
     @Published var history: [HistoryItem] = []
@@ -69,6 +69,7 @@ final class AppModel: ObservableObject, WKNavigationDelegate {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         webView = WKWebView(frame: .zero, configuration: config)
+        super.init()
         webView.allowsBackForwardNavigationGestures = true
         webView.navigationDelegate = self
         loadStore()
@@ -112,13 +113,14 @@ final class AppModel: ObservableObject, WKNavigationDelegate {
                 log("ログイン確認を保留: 現在のWebViewはKashejoのホストではありません")
                 return
             }
-            let result = try await webView.callAsyncJavaScript("""
+            let script = """
             const r = await fetch('/api/v1/me', {credentials:'same-origin', headers:{'Accept':'application/json'}});
             const t = await r.text();
             let parsed = null; try { parsed = JSON.parse(t); } catch (_) {}
             const authenticated = !!(parsed && !parsed.error && (parsed.user || parsed.id || parsed.handle || parsed.authenticated === true || parsed.me));
             return {status:r.status, ok:r.ok, authenticated, isJSON:!!parsed, body:parsed ? JSON.stringify(parsed).slice(0,1200) : t.slice(0,500), url:location.href};
-            """, arguments: [:], in: nil, contentWorld: .page)
+            """
+            let result = try await webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: WKContentWorld.page)
             guard let data = result as? [String: Any] else {
                 status = "確認不能"
                 lastError = "ログイン確認応答の形式が不正です。"
@@ -126,7 +128,6 @@ final class AppModel: ObservableObject, WKNavigationDelegate {
                 return
             }
             let code = data["status"] as? Int ?? 0
-            let body = data["body"] as? String ?? ""
             if code == 200 && (data["authenticated"] as? Bool == true) {
                 status = "ログイン済み"
                 lastError = nil
@@ -205,7 +206,7 @@ final class AppModel: ObservableObject, WKNavigationDelegate {
             // PromiseをevaluateJavaScriptへ返す旧実装はWKWebViewでunsupported typeになる。
             // callAsyncJavaScriptで非同期処理を待ち、Foundation互換の辞書を返す。
             let args: [String: Any] = ["body": item.body, "images": item.images.map { $0.base64EncodedString() }, "imageCount": item.images.count]
-            let result = try await webView.callAsyncJavaScript("""
+            let script = """
             const me = await fetch('/api/v1/me', {credentials:'same-origin', headers:{'Accept':'application/json'}});
             const meText = await me.text(); let meData = null; try { meData = JSON.parse(meText); } catch (_) {}
             const authenticated = !!(meData && !meData.error && (meData.user || meData.id || meData.handle || meData.authenticated === true || meData.me));
@@ -225,7 +226,10 @@ final class AppModel: ObservableObject, WKNavigationDelegate {
               }
               const response = await fetch(form.getAttribute('action') || location.href, {method:'POST', body:fd, credentials:'same-origin', redirect:'follow'});
               const finalPath = new URL(response.url).pathname;
-              const success = response.ok && /\/posts\/\d+/.test(finalPath);
+              const pathParts = finalPath.split('/').filter(Boolean);
+              const lastPart = pathParts[pathParts.length - 1] || '';
+              const previousPart = pathParts[pathParts.length - 2] || '';
+              const success = response.ok && previousPart === 'posts' && lastPart.length > 0 && Number.isInteger(Number(lastPart));
               const responseText = success ? '' : (await response.text()).slice(0,500);
               return {ok:success, stage:'image-post', status:response.status, url:response.url, error:success ? '' : (responseText || '投稿完了URLを確認できませんでした')};
             }
@@ -235,7 +239,8 @@ final class AppModel: ObservableObject, WKNavigationDelegate {
             const postID = parsed && (parsed.id || (parsed.post && parsed.post.id));
             const success = response.ok && !!parsed && !parsed.error && !!postID;
             return {ok:success, stage:'text-post', status:response.status, url:(parsed && (parsed.url || (parsed.post && parsed.post.url))) || '', error:success ? '' : (parsed && parsed.error ? String(parsed.error) : (response.ok ? '投稿IDを含む成功応答を確認できませんでした' : text.slice(0,500)))};
-            """, arguments: args, in: nil, contentWorld: .page)
+            """
+            let result = try await webView.callAsyncJavaScript(script, arguments: args, in: nil, contentWorld: WKContentWorld.page)
             guard let object = result as? [String: Any] else {
                 throw AppError.message("投稿応答の型が不正です。診断ログを確認してください。")
             }
