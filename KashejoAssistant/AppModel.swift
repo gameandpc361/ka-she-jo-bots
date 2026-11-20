@@ -32,7 +32,27 @@ struct PostItem: Identifiable, Codable {
 struct QueueFolder: Identifiable, Codable, Hashable {
     var id = UUID()
     var name: String
+    var parentID: UUID? = nil
     var createdAt = Date()
+}
+
+struct AccountProfile: Identifiable, Codable, Hashable {
+    var id: UUID = UUID()
+    var name: String
+    var siteBaseURL: String
+    var accountID: String
+    var webStoreID: UUID = UUID()
+    var queueIntervalSeconds: Double = 60
+    var queueMaxCount: Int = 10
+    var maxImageCount: Int = 8
+    var openHistoryInApp: Bool = true
+    var isDefault: Bool = false
+    var shareSettingsWithDefault: Bool = false
+    var shareDraftsWithDefault: Bool = false
+
+    static func makeDefault() -> AccountProfile {
+        AccountProfile(name: "デフォルト", siteBaseURL: "https://kashejo.f5.si", accountID: "135", isDefault: true)
+    }
 }
 struct HistoryItem: Identifiable, Codable {
     var id = UUID()
@@ -62,6 +82,8 @@ enum AppError: LocalizedError {
 @MainActor
 final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var webView: WKWebView
+    @Published var profiles: [AccountProfile] = []
+    @Published var activeProfileID: UUID
     @Published var drafts: [PostItem] = []
     @Published var history: [HistoryItem] = []
     @Published var folders: [QueueFolder] = []
@@ -72,34 +94,126 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var logs: [String] = []
     @Published var activeTab = "web"
     @Published var isCheckingSession = false
-    @Published var siteBaseURL: String { didSet { UserDefaults.standard.set(siteBaseURL, forKey: "siteBaseURL") } }
-    @Published var accountID: String { didSet { UserDefaults.standard.set(accountID, forKey: "accountID") } }
-    @Published var queueIntervalSeconds: Double { didSet { UserDefaults.standard.set(queueIntervalSeconds, forKey: "queueIntervalSeconds") } }
-    @Published var queueMaxCount: Int { didSet { UserDefaults.standard.set(queueMaxCount, forKey: "queueMaxCount") } }
-    @Published var maxImageCount: Int { didSet { UserDefaults.standard.set(maxImageCount, forKey: "maxImageCount") } }
-    @Published var openHistoryInApp: Bool { didSet { UserDefaults.standard.set(openHistoryInApp, forKey: "openHistoryInApp") } }
+    @Published var siteBaseURL: String { didSet { UserDefaults.standard.set(siteBaseURL, forKey: "siteBaseURL"); syncActiveProfile() } }
+    @Published var accountID: String { didSet { UserDefaults.standard.set(accountID, forKey: "accountID"); syncActiveProfile() } }
+    @Published var queueIntervalSeconds: Double { didSet { UserDefaults.standard.set(queueIntervalSeconds, forKey: "queueIntervalSeconds"); syncActiveProfile() } }
+    @Published var queueMaxCount: Int { didSet { UserDefaults.standard.set(queueMaxCount, forKey: "queueMaxCount"); syncActiveProfile() } }
+    @Published var maxImageCount: Int { didSet { UserDefaults.standard.set(maxImageCount, forKey: "maxImageCount"); syncActiveProfile() } }
+    @Published var openHistoryInApp: Bool { didSet { UserDefaults.standard.set(openHistoryInApp, forKey: "openHistoryInApp"); syncActiveProfile() } }
     @Published var queueProgress = "待機中"
     private var queueTask: Task<Void, Never>?
     private var liveActivity: Activity<KashejoQueueAttributes>?
+    private var suppressProfileSync = false
 
     override init() {
         let d = UserDefaults.standard
-        siteBaseURL = d.string(forKey: "siteBaseURL") ?? "https://kashejo.f5.si"
-        accountID = d.string(forKey: "accountID") ?? "135"
-        queueIntervalSeconds = max(60, min(3600, d.object(forKey: "queueIntervalSeconds") as? Double ?? 60))
-        queueMaxCount = d.object(forKey: "queueMaxCount") as? Int ?? 10
-        maxImageCount = d.object(forKey: "maxImageCount") as? Int ?? 8
-        openHistoryInApp = d.object(forKey: "openHistoryInApp") as? Bool ?? true
-        let config = WKWebViewConfiguration(); config.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: config)
+        let decodedProfiles = (d.data(forKey: "accountProfiles")).flatMap { try? JSONDecoder().decode([AccountProfile].self, from: $0) } ?? []
+        var initialProfiles = decodedProfiles
+        if initialProfiles.isEmpty {
+            var legacyDefault = AccountProfile.makeDefault()
+            legacyDefault.siteBaseURL = d.string(forKey: "siteBaseURL") ?? legacyDefault.siteBaseURL
+            legacyDefault.accountID = d.string(forKey: "accountID") ?? legacyDefault.accountID
+            legacyDefault.queueIntervalSeconds = d.object(forKey: "queueIntervalSeconds") as? Double ?? legacyDefault.queueIntervalSeconds
+            legacyDefault.queueMaxCount = d.object(forKey: "queueMaxCount") as? Int ?? legacyDefault.queueMaxCount
+            legacyDefault.maxImageCount = d.object(forKey: "maxImageCount") as? Int ?? legacyDefault.maxImageCount
+            legacyDefault.openHistoryInApp = d.object(forKey: "openHistoryInApp") as? Bool ?? legacyDefault.openHistoryInApp
+            initialProfiles = [legacyDefault]
+        }
+        if !initialProfiles.contains(where: \.isDefault) { initialProfiles.insert(.makeDefault(), at: 0) }
+        profiles = initialProfiles
+        let requestedID = d.string(forKey: "activeProfileID").flatMap(UUID.init(uuidString:))
+        let initialProfile = initialProfiles.first(where: { $0.id == requestedID }) ?? initialProfiles.first(where: \.isDefault)!
+        activeProfileID = initialProfile.id
+        let settingsProfile = initialProfile.shareSettingsWithDefault ? (initialProfiles.first(where: \.isDefault) ?? initialProfile) : initialProfile
+        siteBaseURL = settingsProfile.siteBaseURL
+        accountID = settingsProfile.accountID
+        queueIntervalSeconds = max(5, min(3600, settingsProfile.queueIntervalSeconds))
+        queueMaxCount = max(1, min(50, settingsProfile.queueMaxCount))
+        maxImageCount = max(1, min(20, settingsProfile.maxImageCount))
+        openHistoryInApp = settingsProfile.openHistoryInApp
+        webView = Self.makeWebView(for: initialProfile)
         super.init()
         webView.navigationDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+        persistProfiles()
         loadStore()
         logs = d.stringArray(forKey: "diagnosticLogs") ?? []
         webView.load(URLRequest(url: normalizedBaseURL ?? URL(string: "https://kashejo.f5.si")!))
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
         log("起動。WKWebView標準セッションを使用")
+    }
+
+    private static func makeWebView(for profile: AccountProfile) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        if profile.isDefault { configuration.websiteDataStore = .default() }
+        else if #available(iOS 17.0, *) { configuration.websiteDataStore = WKWebsiteDataStore(forIdentifier: profile.webStoreID) }
+        else { configuration.websiteDataStore = .default() }
+        return WKWebView(frame: .zero, configuration: configuration)
+    }
+
+    private func persistProfiles() {
+        if let data = try? JSONEncoder().encode(profiles) { UserDefaults.standard.set(data, forKey: "accountProfiles") }
+        UserDefaults.standard.set(activeProfileID.uuidString, forKey: "activeProfileID")
+    }
+
+    private func syncActiveProfile() {
+        guard !suppressProfileSync, let index = profiles.firstIndex(where: { $0.id == activeProfileID }) else { return }
+        profiles[index].siteBaseURL = siteBaseURL
+        profiles[index].accountID = accountID
+        profiles[index].queueIntervalSeconds = queueIntervalSeconds
+        profiles[index].queueMaxCount = queueMaxCount
+        profiles[index].maxImageCount = maxImageCount
+        profiles[index].openHistoryInApp = openHistoryInApp
+        if profiles[index].shareSettingsWithDefault, let defaultIndex = profiles.firstIndex(where: \.isDefault), defaultIndex != index {
+            profiles[defaultIndex].queueIntervalSeconds = queueIntervalSeconds
+            profiles[defaultIndex].queueMaxCount = queueMaxCount
+            profiles[defaultIndex].maxImageCount = maxImageCount
+            profiles[defaultIndex].openHistoryInApp = openHistoryInApp
+        }
+        persistProfiles()
+    }
+
+    func addAccount(name: String, siteURL: String, accountID: String, shareSettings: Bool, shareDrafts: Bool) {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, let url = URL(string: siteURL), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else { lastError = "アカウント名またはサイトURLが不正です"; return }
+        let base = profiles.first(where: \.isDefault) ?? profiles[0]
+        let profile = AccountProfile(name: clean, siteBaseURL: siteURL, accountID: accountID, queueIntervalSeconds: shareSettings ? base.queueIntervalSeconds : queueIntervalSeconds, queueMaxCount: shareSettings ? base.queueMaxCount : queueMaxCount, maxImageCount: shareSettings ? base.maxImageCount : maxImageCount, openHistoryInApp: shareSettings ? base.openHistoryInApp : openHistoryInApp, shareSettingsWithDefault: shareSettings, shareDraftsWithDefault: shareDrafts)
+        profiles.append(profile); persistProfiles(); log("アカウント追加: \(clean)")
+    }
+
+    func switchAccount(_ id: UUID) {
+        guard id != activeProfileID, let profile = profiles.first(where: { $0.id == id }) else { return }
+        stopQueue(); persist()
+        suppressProfileSync = true
+        activeProfileID = id
+        let settings = profile.shareSettingsWithDefault ? (profiles.first(where: \.isDefault) ?? profile) : profile
+        siteBaseURL = profile.siteBaseURL; accountID = profile.accountID
+        queueIntervalSeconds = settings.queueIntervalSeconds; queueMaxCount = settings.queueMaxCount
+        maxImageCount = settings.maxImageCount; openHistoryInApp = settings.openHistoryInApp
+        let nextWebView = Self.makeWebView(for: profile)
+        nextWebView.navigationDelegate = self; nextWebView.allowsBackForwardNavigationGestures = true
+        webView = nextWebView
+        suppressProfileSync = false
+        persistProfiles(); loadStore()
+        if let url = normalizedBaseURL { webView.load(URLRequest(url: url)) }
+        status = "アカウント切替: \(profile.name)"; log("アカウント切替: \(profile.name)")
+    }
+
+    func deleteAccount(_ id: UUID) {
+        guard let profile = profiles.first(where: { $0.id == id }), !profile.isDefault else { return }
+        if activeProfileID == id { switchAccount(profiles.first(where: \.isDefault)!.id) }
+        if #available(iOS 17.0, *) {
+            WKWebsiteDataStore.remove(forIdentifier: profile.webStoreID) { [weak self] error in
+                Task { @MainActor in self?.log(error == nil ? "WebKitデータ領域を削除: \(profile.name)" : "WebKitデータ領域削除失敗: \(error!.localizedDescription)") }
+            }
+        }
+        profiles.removeAll { $0.id == id }; persistProfiles(); log("アカウント設定を削除: \(profile.name)")
+    }
+
+    func folderPath(_ folder: QueueFolder) -> String {
+        var names = [folder.name]; var parent = folder.parentID; var visited = Set<UUID>()
+        while let id = parent, !visited.contains(id), let item = folders.first(where: { $0.id == id }) { visited.insert(id); names.insert(item.name, at: 0); parent = item.parentID }
+        return names.joined(separator: " / ")
     }
 
     var normalizedBaseURL: URL? {
@@ -208,24 +322,48 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     }
     private func expandRandomTokens(_ input: String) -> String {
         let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789")
-        return input.replacingOccurrences(of: "{random}", with: String((0..<8).compactMap { _ in alphabet.randomElement() }))
+        let pattern = #"\{random(?::(\d+))?\}"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return input }
+        let ns = input as NSString
+        let matches = regex.matches(in: input, range: NSRange(location: 0, length: ns.length)).reversed()
+        var output = input
+        for match in matches {
+            let length = match.range(at: 1).location == NSNotFound ? 8 : min(128, max(1, Int(ns.substring(with: match.range(at: 1))) ?? 8))
+            let token = String((0..<length).compactMap { _ in alphabet.randomElement() })
+            if let range = Range(match.range, in: output) { output.replaceSubrange(range, with: token) }
+        }
+        return output
     }
-    func createFolder(name: String) {
+    func createFolder(name: String, parentID: UUID? = nil) {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
-        let folder = QueueFolder(name: clean); folders.append(folder); selectedFolderID = folder.id; persist(); log("キューフォルダ作成: \(clean)")
+        let folder = QueueFolder(name: clean, parentID: parentID); folders.append(folder); selectedFolderID = folder.id; persist(); log("キューフォルダ作成: \(folderPath(folder))")
+    }
+    func deleteFolder(_ id: UUID) {
+        let descendants = Set(folders.filter { $0.parentID == id }.map(\.id))
+        var all = descendants; var changed = true
+        while changed { let next = Set(folders.filter { $0.parentID.map(all.contains) == true }.map(\.id)); changed = !next.isSubset(of: all); all.formUnion(next) }
+        all.insert(id)
+        for index in drafts.indices where drafts[index].folderID.map(all.contains) == true { drafts[index].folderID = nil }
+        folders.removeAll { all.contains($0.id) }; if selectedFolderID.map(all.contains) == true { selectedFolderID = nil }; persist(); log("フォルダと配下を削除: \(all.count)個。下書きは未分類へ移動")
     }
     func deleteDraft(_ item: PostItem) { drafts.removeAll { $0.id == item.id }; UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [item.id.uuidString]); persist() }
+    func deleteDrafts(_ ids: Set<UUID>) { drafts.removeAll { ids.contains($0.id) }; for id in ids { UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id.uuidString]) }; persist(); log("下書き一括削除: \(ids.count)件") }
+    func deleteHistory(_ id: UUID) { history.removeAll { $0.id == id }; persist(); log("履歴削除") }
+    func deleteAllHistory() { history.removeAll(); persist(); log("履歴を全削除") }
     func moveDrafts(_ ids: Set<UUID>, to folderID: UUID?) {
         for index in drafts.indices where ids.contains(drafts[index].id) { drafts[index].folderID = folderID }
         persist(); log("下書き\(ids.count)件をフォルダへ移動")
     }
     func drafts(in folder: UUID?) -> [PostItem] { drafts.filter { $0.folderID == folder } }
 
-    func startQueue() {
+    func startQueue(draftIDs: Set<UUID>? = nil) {
         guard queueTask == nil else { return }
-        let batch = Array(drafts(in: selectedFolderID).prefix(max(1, min(queueMaxCount, 10))))
-        guard !batch.isEmpty else { queueProgress = "選択フォルダに下書きがありません"; return }
+        let source: [PostItem]
+        if let draftIDs, !draftIDs.isEmpty { source = drafts.filter { draftIDs.contains($0.id) } }
+        else { source = drafts(in: selectedFolderID) }
+        let batch = Array(source.prefix(max(1, min(queueMaxCount, 50))))
+        guard !batch.isEmpty else { queueProgress = "投稿対象の下書きがありません"; return }
         beginLiveActivity(total: batch.count)
         queueTask = Task {
             for (index, item) in batch.enumerated() {
@@ -235,7 +373,7 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
                 if !(await post(item)) { queueProgress = "失敗：\(index+1)/\(batch.count)"; break }
                 await updateLiveActivity(completed: index+1, total: batch.count, status: "完了 \(index+1)/\(batch.count)", nextAt: nil)
                 if index < batch.count-1 {
-                    let interval = max(60, min(3600, queueIntervalSeconds))
+                    let interval = max(5, min(3600, queueIntervalSeconds))
                     let next = Date().addingTimeInterval(interval)
                     await updateLiveActivity(completed: index+1, total: batch.count, status: "次の投稿を待機中", nextAt: next)
                     do { try await Task.sleep(for: .seconds(interval)) } catch { break }
@@ -291,7 +429,22 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         if let r = navigationResponse.response as? HTTPURLResponse { log("Navigation HTTP \(r.statusCode) \(r.url?.host ?? "")\(r.url?.path ?? "") MIME=\(r.mimeType ?? "-") bytes=\(r.expectedContentLength)") }; decisionHandler(.allow)
     }
-    private var storeURL: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("kashejo-data.json") }
-    private func loadStore() { guard let data = try? Data(contentsOf: storeURL), let store = try? JSONDecoder().decode(StoreData.self, from: data) else { return }; drafts = store.drafts; history = store.history; folders = store.folders }
+    private var storeURL: URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let profile = profiles.first(where: { $0.id == activeProfileID })
+        let owner = profile?.shareDraftsWithDefault == true ? (profiles.first(where: \.isDefault)?.id ?? activeProfileID) : activeProfileID
+        return root.appendingPathComponent("KashejoProfiles", isDirectory: true).appendingPathComponent(owner.uuidString, isDirectory: true).appendingPathComponent("kashejo-data.json")
+    }
+    private func loadStore() {
+        drafts = []; history = []; folders = []
+        var source = storeURL
+        if !FileManager.default.fileExists(atPath: source.path), profiles.first(where: { $0.id == activeProfileID })?.isDefault == true {
+            let legacy = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("kashejo-data.json")
+            if FileManager.default.fileExists(atPath: legacy.path) { source = legacy }
+        }
+        guard let data = try? Data(contentsOf: source), let store = try? JSONDecoder().decode(StoreData.self, from: data) else { return }
+        drafts = store.drafts; history = store.history; folders = store.folders
+        if source != storeURL { persist(); log("旧バージョンの下書き・履歴を移行") }
+    }
     private func persist() { do { try FileManager.default.createDirectory(at: storeURL.deletingLastPathComponent(), withIntermediateDirectories: true); try JSONEncoder().encode(StoreData(drafts: drafts, history: history, folders: folders)).write(to: storeURL, options: .atomic) } catch { lastError = "保存失敗: \(error.localizedDescription)"; log("ローカル保存失敗") } }
 }
