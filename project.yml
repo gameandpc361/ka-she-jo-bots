@@ -23,6 +23,7 @@ targets:
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         CODE_SIGN_STYLE: Automatic
     info:
+      path: KashejoAssistant/Info.plist
       properties:
         NSSupportsLiveActivities: true
         BGTaskSchedulerPermittedIdentifiers:
@@ -47,6 +48,7 @@ targets:
         SKIP_INSTALL: YES
         CODE_SIGN_STYLE: Automatic
     info:
+      path: KashejoLiveActivity/Info.plist
       properties:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
