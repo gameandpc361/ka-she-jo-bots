@@ -59,7 +59,7 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     }
     private var queueTask: Task<Void, Never>?
 
-    init() {
+    override init() {
         let defaults = UserDefaults.standard
         siteBaseURL = defaults.string(forKey: "siteBaseURL") ?? "https://kashejo.f5.si"
         accountID = defaults.string(forKey: "accountID") ?? "135"
