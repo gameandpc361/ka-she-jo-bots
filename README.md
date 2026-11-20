@@ -1,6 +1,14 @@
-# Kashejo Assistant 1.1.0 (build 6)
+# Kashejo Assistant 1.1.1 (build 7)
 
-## v1.1.0 の変更
+## v1.1.1 の変更
+- 投稿JavaScriptを内部catchで保護し、失敗段階・例外メッセージ・stackを診断ログへ記録。
+- ファイル選択シートを投稿画面に直接結び付け、画像UTTypeで起動。セキュリティスコープ内で読み込み。
+- Webタブ/設定に現在の完全なURL表示とコピーを追加。
+- 現在のWeb画面のURL・リンクDOMからアカウントIDを自動取得（API不使用）。
+- 投稿間隔・キュー件数・最大画像枚数に数字入力欄を追加。スライダーも併用。
+- アプリ本体Info.plistにNSSupportsLiveActivitiesを追加。
+
+## v1.1.0 からの機能
 - PhotosPickerの読込を選択変更イベントに限定し、タブ復帰時の画像二重追加を防止。
 - Filesのファイル選択はセキュリティスコープとNSFileCoordinatorを使って読み込み、画像データとして検証。
 - 投稿間隔を5〜3600秒に変更。
