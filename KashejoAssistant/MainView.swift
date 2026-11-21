@@ -122,6 +122,17 @@ struct MainView: View {
                     }
                     Text("GIFは元データを保持して送信します。10MiB超過などは警告のみで、アプリ側では除外しません。サーバー側の制限により拒否される場合があります。").font(.footnote).foregroundStyle(.secondary)
                 }
+                Section("画像メタデータ") {
+                    Toggle("下書き作成時にランダム文字列を付加", isOn: $model.imageMetadataRandomEnabled)
+                    if model.imageMetadataRandomEnabled {
+                        TextField("例: {random:16}", text: $model.imageMetadataRandomTemplate)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        Text("{random} は8文字、{random:数字} は指定文字数（1〜128文字）の英数字に置換します。画像ごと・下書きごとに別の文字列を生成します。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Text("下書き保存時に画像のメタデータへ付加します。元の選択画像は変更しません。GIFはComment Extensionを挿入し、アニメーションデータを再エンコードせず保持します。対応外形式や書き込み失敗時は元画像を保存し、ログに記録します。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("下書きの一括作成") {
                     Stepper("作成数: \(duplicateCount)件（最大10件）", value: $duplicateCount, in: 1...10)
                     Button("同じ画像・本文で下書きを\(duplicateCount)件作成") {
@@ -325,8 +336,10 @@ struct MainView: View {
                 Section("WebView / User-Agent") {
                     Text("現在のUser-Agent")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text(model.webView.customUserAgent ?? "iOS標準（WKWebView既定）")
+                    Text(model.currentUserAgent)
                         .font(.caption2).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("現在のUser-Agentを再取得") { model.refreshCurrentUserAgent() }
                     TextField("カスタムUser-Agent（空欄で標準）", text: $model.customUserAgent, axis: .vertical)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     Button("標準User-Agentに戻す") { model.customUserAgent = ""; model.webView.reload() }

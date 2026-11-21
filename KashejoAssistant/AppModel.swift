@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 import UserNotifications
 import ActivityKit
 import BackgroundTasks
+import ImageIO
+import CoreGraphics
 
 struct PostItem: Identifiable, Codable {
     var id = UUID()
@@ -74,6 +76,84 @@ private struct StoreData: Codable {
         folders = try c.decodeIfPresent([QueueFolder].self, forKey: .folders) ?? []
     }
 }
+enum ImageMetadataRandomizer {
+    enum MetadataError: LocalizedError {
+        case invalidImage
+        case unsupportedFormat
+        case destinationCreationFailed
+        case finalizationFailed
+        var errorDescription: String? {
+            switch self {
+            case .invalidImage: return "画像データを認識できません"
+            case .unsupportedFormat: return "この画像形式のメタデータ付加には対応していません"
+            case .destinationCreationFailed: return "画像のメタデータ書き込み先を作成できません"
+            case .finalizationFailed: return "メタデータを書き込めませんでした"
+            }
+        }
+    }
+
+    static func addComment(_ comment: String, to data: Data) throws -> Data {
+        guard !comment.isEmpty, let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(source) else { throw MetadataError.invalidImage }
+        let typeName = type as String
+
+        // GIFはファイル末尾のTrailer直前にComment Extensionを挿入する。
+        // 画像フレーム・圧縮データ・アニメーション時間を再エンコードせず、そのまま維持する。
+        if typeName.lowercased().contains("gif") {
+            return try addGIFComment(comment, to: data)
+        }
+
+        let supported = ["public.jpeg", "public.png", "public.heic", "public.heif", "public.tiff"]
+        guard supported.contains(typeName) else { throw MetadataError.unsupportedFormat }
+        let frameCount = CGImageSourceGetCount(source)
+        guard frameCount > 0 else { throw MetadataError.invalidImage }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, type, frameCount, nil) else {
+            throw MetadataError.destinationCreationFailed
+        }
+
+        let sourceProperties = (CGImageSourceCopyProperties(source, nil) as? [String: Any]) ?? [:]
+        var properties = sourceProperties
+        if typeName == "public.png" {
+            var png = properties[kCGImagePropertyPNGDictionary as String] as? [String: Any] ?? [:]
+            png[kCGImagePropertyPNGDescription as String] = comment
+            properties[kCGImagePropertyPNGDictionary as String] = png
+        } else {
+            var exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+            exif[kCGImagePropertyExifUserComment as String] = comment
+            properties[kCGImagePropertyExifDictionary as String] = exif
+        }
+        // 画質劣化を抑え、全フレームを元の順番で保持する。
+        properties[kCGImageDestinationLossyCompressionQuality as String] = 1.0
+        for index in 0..<frameCount {
+            CGImageDestinationAddImageFromSource(destination, source, index, properties as CFDictionary)
+        }
+        guard CGImageDestinationFinalize(destination) else { throw MetadataError.finalizationFailed }
+        return output as Data
+    }
+
+    private static func addGIFComment(_ comment: String, to data: Data) throws -> Data {
+        guard data.count >= 14,
+              let header = String(data: data.prefix(6), encoding: .ascii),
+              header == "GIF87a" || header == "GIF89a",
+              data.last == 0x3B else { throw MetadataError.invalidImage }
+        let bytes = Array(comment.utf8)
+        var extensionBytes = Data([0x21, 0xFE])
+        var offset = 0
+        while offset < bytes.count {
+            let length = min(255, bytes.count - offset)
+            extensionBytes.append(UInt8(length))
+            extensionBytes.append(contentsOf: bytes[offset..<(offset + length)])
+            offset += length
+        }
+        extensionBytes.append(0x00)
+        var result = Data(data.dropLast())
+        result.append(extensionBytes)
+        result.append(0x3B)
+        return result
+    }
+}
+
 enum AppError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let value) = self { return value }; return "不明なエラー" }
@@ -105,6 +185,13 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var queueRemainingSeconds: Int = 0
     @Published var queueLogs: [String] = []
     @Published var customUserAgent: String = UserDefaults.standard.string(forKey: "customUserAgent") ?? "" { didSet { UserDefaults.standard.set(customUserAgent, forKey: "customUserAgent"); applyUserAgent() } }
+    @Published var currentUserAgent: String = "Webページ読み込み後に取得します"
+    @Published var imageMetadataRandomEnabled: Bool = UserDefaults.standard.bool(forKey: "imageMetadataRandomEnabled") {
+        didSet { UserDefaults.standard.set(imageMetadataRandomEnabled, forKey: "imageMetadataRandomEnabled") }
+    }
+    @Published var imageMetadataRandomTemplate: String = UserDefaults.standard.string(forKey: "imageMetadataRandomTemplate") ?? "{random:16}" {
+        didSet { UserDefaults.standard.set(imageMetadataRandomTemplate, forKey: "imageMetadataRandomTemplate") }
+    }
     private var queueTask: Task<Void, Never>?
     private var liveActivity: Activity<KashejoQueueAttributes>?
     private var suppressProfileSync = false
@@ -225,7 +312,30 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     func applyUserAgent() {
         let value = customUserAgent.trimmingCharacters(in: .whitespacesAndNewlines)
         webView.customUserAgent = value.isEmpty ? nil : value
-        log(value.isEmpty ? "User-Agent: iOS標準" : "User-Agent: カスタム設定を適用")
+        currentUserAgent = value.isEmpty ? "標準User-Agentを取得中…" : value
+        log(value.isEmpty ? "User-Agent: iOS標準を使用" : "User-Agent: カスタム設定を適用")
+        refreshCurrentUserAgent()
+    }
+
+    /// WKWebViewが実際にページへ送っているUser-AgentをJavaScript側から取得する。
+    func refreshCurrentUserAgent() {
+        guard webView.url != nil else {
+            currentUserAgent = customUserAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Webページ読み込み後に取得します" : customUserAgent
+            return
+        }
+        webView.evaluateJavaScript("navigator.userAgent") { [weak self] result, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if let value = result as? String, !value.isEmpty {
+                    self.currentUserAgent = value
+                } else if let error {
+                    self.currentUserAgent = "取得失敗: \(error.localizedDescription)"
+                } else {
+                    self.currentUserAgent = self.webView.customUserAgent ?? "取得できませんでした"
+                }
+            }
+        }
     }
 
     var normalizedBaseURL: URL? {
@@ -363,14 +473,35 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
     }
 
     func saveDraft(body: String, images: [Data], scheduledAt: Date? = nil, folderID: UUID? = nil) {
-        let item = PostItem(body: body, images: images, scheduledAt: scheduledAt, folderID: folderID ?? selectedFolderID)
+        let preparedImages = prepareDraftImages(images)
+        let item = PostItem(body: body, images: preparedImages, scheduledAt: scheduledAt, folderID: folderID ?? selectedFolderID)
         drafts.insert(item, at: 0); persist(); if let date = scheduledAt { scheduleReminder(for: item, at: date) }
-        log("下書き保存 folder=\(item.folderID?.uuidString ?? "未分類") images=\(images.count)")
+        log("下書き保存 folder=\(item.folderID?.uuidString ?? "未分類") images=\(preparedImages.count)")
     }
     func duplicateDrafts(bodyTemplate: String, images: [Data], count: Int) {
         let safeCount = min(max(count, 1), 10)
-        for _ in 0..<safeCount { saveDraft(body: expandRandomTokens(bodyTemplate), images: images, folderID: selectedFolderID) }
-        log("下書きを\(safeCount)件作成（{random}展開済み）")
+        for _ in 0..<safeCount {
+            let expandedBody = expandRandomTokens(bodyTemplate)
+            saveDraft(body: expandedBody, images: images, folderID: selectedFolderID)
+        }
+        log("下書きを\(safeCount)件作成（本文・画像メタデータのランダム文字列を個別生成）")
+    }
+
+    private func prepareDraftImages(_ images: [Data]) -> [Data] {
+        guard imageMetadataRandomEnabled else { return images }
+        let template = imageMetadataRandomTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !template.isEmpty else { log("画像メタデータ付加をスキップ: テンプレートが空です"); return images }
+        return images.enumerated().map { index, data in
+            let value = expandRandomTokens(template)
+            do {
+                let output = try ImageMetadataRandomizer.addComment(value, to: data)
+                log("画像メタデータ付加成功: \(index + 1)枚目")
+                return output
+            } catch {
+                log("画像メタデータ付加失敗: \(index + 1)枚目 / \(error.localizedDescription)。元画像を保存")
+                return data
+            }
+        }
     }
     private func expandRandomTokens(_ input: String) -> String {
         let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789")
@@ -506,7 +637,11 @@ final class AppModel: NSObject, ObservableObject, WKNavigationDelegate {
         let header = "Kashejo Assistant diagnostics\nGenerated: \(Date())\nNote: authentication secrets are intentionally excluded. WKWebView subresource traffic is not fully captured.\n\n"
         do { try (header + logs.reversed().joined(separator: "\n")).write(to: url, atomically: true, encoding: .utf8); log("ログを書き出し") ; return url } catch { lastError = error.localizedDescription; return nil }
     }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { log("WebView読込完了: \(webView.url?.host ?? "unknown")\(webView.url?.path ?? "") title=\(webView.title ?? "")"); Task { await checkSession() } }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        log("WebView読込完了: \(webView.url?.host ?? "unknown")\(webView.url?.path ?? "") title=\(webView.title ?? "")")
+        refreshCurrentUserAgent()
+        Task { await checkSession() }
+    }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { log("WebView読込失敗: \(error.localizedDescription)"); lastError = error.localizedDescription }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { log("WebView遷移失敗: \(error.localizedDescription)"); lastError = error.localizedDescription }
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
